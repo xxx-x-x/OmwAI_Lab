@@ -1,12 +1,11 @@
 import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto'
 import { lookup } from 'node:dns/promises'
-import { mkdirSync } from 'node:fs'
 import { isIP } from 'node:net'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { join } from 'node:path'
-import { DatabaseSync } from 'node:sqlite'
 import react from '@vitejs/plugin-react'
 import { defineConfig, loadEnv, type Plugin, type PreviewServer, type ViteDevServer } from 'vite'
+import { createDatabase, initializeDatabase, type DatabaseRow } from './server/mysql.js'
+import { modelKeys, providerIdsForCreator } from './server/model-key.js'
 
 const MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 const PROBE_TIMEOUT_MS = 10_000
@@ -168,36 +167,21 @@ function groupProbePlugin(): Plugin {
   }
 }
 
-function authPlugin(clientId: string, clientSecret: string, googleClientId: string, googleClientSecret: string): Plugin {
-  mkdirSync(join(process.cwd(), 'data'), { recursive: true })
-  const database = new DatabaseSync(join(process.cwd(), 'data', 'omwai.db'))
-  database.exec(`
-    CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE COLLATE NOCASE, email TEXT NOT NULL UNIQUE COLLATE NOCASE, password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-    CREATE TABLE IF NOT EXISTS submissions (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, submitter_login TEXT NOT NULL, name TEXT NOT NULL, website TEXT NOT NULL, models TEXT NOT NULL, pricing TEXT NOT NULL, notes TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending', review_note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(user_id) REFERENCES users(id));
-    CREATE TABLE IF NOT EXISTS managed_providers (id INTEGER PRIMARY KEY AUTOINCREMENT, submission_id INTEGER UNIQUE, name TEXT NOT NULL, website TEXT NOT NULL UNIQUE, models TEXT NOT NULL, pricing TEXT NOT NULL, notes TEXT NOT NULL DEFAULT '', active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-    CREATE TABLE IF NOT EXISTS audit_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id INTEGER NOT NULL, action TEXT NOT NULL, target_type TEXT NOT NULL, target_id INTEGER, details TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-    CREATE TABLE IF NOT EXISTS model_rankings (slug TEXT PRIMARY KEY, name TEXT NOT NULL, creator TEXT NOT NULL, creator_color TEXT NOT NULL DEFAULT '#625bf6', creator_logo TEXT NOT NULL DEFAULT '', context_window_tokens INTEGER NOT NULL DEFAULT 0, intelligence_index REAL, intelligence_estimated INTEGER NOT NULL DEFAULT 0, cost_per_task REAL, input_price REAL, output_price REAL, median_tokens_per_second REAL, latency_seconds REAL, total_response_seconds REAL, is_reasoning INTEGER NOT NULL DEFAULT 0, is_open_weights INTEGER NOT NULL DEFAULT 0, deprecated INTEGER NOT NULL DEFAULT 0, synced_at TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS model_ranking_syncs (id INTEGER PRIMARY KEY AUTOINCREMENT, source_url TEXT NOT NULL, model_count INTEGER NOT NULL, synced_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-  `)
-  const userColumns = database.prepare('PRAGMA table_info(users)').all() as Array<{ name: string }>
-  if (!userColumns.some(column => column.name === 'role')) database.exec("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")
+function authPlugin(clientId: string, clientSecret: string, googleClientId: string, googleClientSecret: string, databaseUrl: string): Plugin {
+  const database = createDatabase(databaseUrl)
+  let ready: Promise<void> | undefined
   const syncModelRankings = async () => {
     const models = await fetchModelLeaderboard()
     if (models.length < 50) throw new Error('源站返回的模型数量异常，已保留原有数据')
-    const syncedAt = new Date().toISOString()
-    const insert = database.prepare(`INSERT INTO model_rankings (slug, name, creator, creator_color, creator_logo, context_window_tokens, intelligence_index, intelligence_estimated, cost_per_task, input_price, output_price, median_tokens_per_second, latency_seconds, total_response_seconds, is_reasoning, is_open_weights, deprecated, synced_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-    database.exec('BEGIN IMMEDIATE')
-    try {
-      database.exec('DELETE FROM model_rankings')
-      for (const model of models) insert.run(String(model.slug ?? ''), String(model.name ?? model.shortName ?? ''), String(model.modelCreatorName ?? 'Unknown'), String(model.modelCreatorColor ?? '#625bf6'), String(model.modelCreatorLogo ?? ''), Number(model.contextWindowTokens ?? 0), model.intelligenceIndex == null ? null : Number(model.intelligenceIndex), model.intelligenceIndexIsEstimated ? 1 : 0, model.intelligenceIndexCostPerTask == null ? null : Number(model.intelligenceIndexCostPerTask), model.price1mInputTokens == null ? null : Number(model.price1mInputTokens), model.price1mOutputTokens == null ? null : Number(model.price1mOutputTokens), model.medianOutputTokensPerSecond == null ? null : Number(model.medianOutputTokensPerSecond), model.medianTimeToFirstTokenSeconds == null ? null : Number(model.medianTimeToFirstTokenSeconds), model.medianEndToEndResponseTimeSeconds == null ? null : Number(model.medianEndToEndResponseTimeSeconds), model.isReasoning ? 1 : 0, model.isOpenWeights ? 1 : 0, model.deprecated ? 1 : 0, syncedAt)
-      database.prepare('INSERT INTO model_ranking_syncs (source_url, model_count, synced_at) VALUES (?, ?, ?)').run(LEADERBOARD_URL, models.length, syncedAt)
-      database.exec('COMMIT')
-    } catch (error) {
-      database.exec('ROLLBACK')
-      throw error
-    }
-    return { count: models.length, syncedAt }
+    const syncedAt = new Date()
+    const sql = `INSERT INTO model_rankings (slug, name, creator, creator_color, creator_logo, context_window_tokens, intelligence_index, intelligence_estimated, cost_per_task, input_price, output_price, median_tokens_per_second, latency_seconds, total_response_seconds, is_reasoning, is_open_weights, deprecated, synced_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    await database.transaction(async connection => {
+      await database.run('DELETE FROM model_rankings', [], connection)
+      for (const model of models) await database.run(sql, [String(model.slug ?? ''), String(model.name ?? model.shortName ?? ''), String(model.modelCreatorName ?? 'Unknown'), String(model.modelCreatorColor ?? '#625bf6'), String(model.modelCreatorLogo ?? ''), Number(model.contextWindowTokens ?? 0), model.intelligenceIndex == null ? null : Number(model.intelligenceIndex), model.intelligenceIndexIsEstimated ? 1 : 0, model.intelligenceIndexCostPerTask == null ? null : Number(model.intelligenceIndexCostPerTask), model.price1mInputTokens == null ? null : Number(model.price1mInputTokens), model.price1mOutputTokens == null ? null : Number(model.price1mOutputTokens), model.medianOutputTokensPerSecond == null ? null : Number(model.medianOutputTokensPerSecond), model.medianTimeToFirstTokenSeconds == null ? null : Number(model.medianTimeToFirstTokenSeconds), model.medianEndToEndResponseTimeSeconds == null ? null : Number(model.medianEndToEndResponseTimeSeconds), model.isReasoning ? 1 : 0, model.isOpenWeights ? 1 : 0, model.deprecated ? 1 : 0, syncedAt], connection)
+      await database.run('INSERT INTO model_ranking_syncs (source_url, model_count, synced_at) VALUES (?, ?, ?)', [LEADERBOARD_URL, models.length, syncedAt], connection)
+    })
+    return { count: models.length, syncedAt: syncedAt.toISOString() }
   }
   const sessions = new Map<string, Session>()
   const oauthStates = new Map<string, number>()
@@ -209,12 +193,33 @@ function authPlugin(clientId: string, clientSecret: string, googleClientId: stri
   }
 
   const install = (server: ViteDevServer | PreviewServer) => { server.middlewares.use(async (request, response, next) => {
+    ready ??= initializeDatabase(database)
+    await ready
     const url = new URL(request.url ?? '/', 'http://localhost')
-    if (!url.pathname.startsWith('/api/auth/') && !url.pathname.startsWith('/api/submissions') && !url.pathname.startsWith('/api/admin/') && !url.pathname.startsWith('/api/user/') && !url.pathname.startsWith('/api/model-rankings')) return next()
+    if (!url.pathname.startsWith('/api/auth/') && !url.pathname.startsWith('/api/submissions') && !url.pathname.startsWith('/api/admin/') && !url.pathname.startsWith('/api/user/') && !url.pathname.startsWith('/api/model-rankings') && !url.pathname.startsWith('/api/model-prices')) return next()
 
     if (url.pathname === '/api/model-rankings' && request.method === 'GET') {
-      const models = database.prepare(`SELECT slug AS id, name, creator, creator_color AS color, creator_logo AS logo, context_window_tokens AS contextWindowTokens, intelligence_index AS score, intelligence_estimated AS scoreEstimated, cost_per_task AS costPerTask, input_price AS inputPrice, output_price AS outputPrice, median_tokens_per_second AS speed, latency_seconds AS latency, total_response_seconds AS totalResponse, is_reasoning AS reasoning, is_open_weights AS openWeights FROM model_rankings WHERE deprecated = 0 AND intelligence_index IS NOT NULL ORDER BY intelligence_index DESC`).all()
-      const latest = database.prepare('SELECT model_count AS modelCount, synced_at AS syncedAt, source_url AS sourceUrl FROM model_ranking_syncs ORDER BY id DESC LIMIT 1').get() ?? null
+      const models = await database.prepare(`SELECT slug AS id, name, creator, creator_color AS color, creator_logo AS logo, context_window_tokens AS contextWindowTokens, intelligence_index AS score, intelligence_estimated AS scoreEstimated, cost_per_task AS costPerTask, input_price AS inputPrice, output_price AS outputPrice, median_tokens_per_second AS speed, latency_seconds AS latency, total_response_seconds AS totalResponse, is_reasoning AS reasoning, is_open_weights AS openWeights FROM model_rankings WHERE deprecated = 0 AND intelligence_index IS NOT NULL ORDER BY intelligence_index DESC`).all()
+      const latest = await database.prepare('SELECT model_count AS modelCount, synced_at AS syncedAt, source_url AS sourceUrl FROM model_ranking_syncs ORDER BY id DESC LIMIT 1').get() ?? null
+      return json(response, 200, { models, latest })
+    }
+    if (url.pathname === '/api/model-prices' && request.method === 'GET') {
+      type RankingPriceRow = DatabaseRow & { id: string; name: string; creator: string; accent: string; score: number; reasoning: number; openWeights: number }
+      type OfficialPriceRow = DatabaseRow & { providerId: string; modelId: string; modelKey: string; providerIconUrl: string; inputPrice: number | null; outputPrice: number | null; cachedInputPrice: number | null; sourceUrl: string }
+      const rankings = await database.prepare(`SELECT slug AS id, name, creator, creator_color AS accent, intelligence_index AS score, is_reasoning AS reasoning, is_open_weights AS openWeights FROM model_rankings WHERE deprecated = 0 AND intelligence_index IS NOT NULL ORDER BY intelligence_index DESC`).all<RankingPriceRow>()
+      const prices = await database.prepare("SELECT provider_id AS providerId, model_id AS modelId, model_key AS modelKey, provider_icon_url AS providerIconUrl, input_price AS inputPrice, output_price AS outputPrice, cached_input_price AS cachedInputPrice, source_url AS sourceUrl FROM model_prices WHERE source_id = 'official'").all<OfficialPriceRow>()
+      const used = new Set<string>()
+      const models = rankings.flatMap(ranking => {
+        const providerIds = new Set(providerIdsForCreator(ranking.creator))
+        const keys = modelKeys(ranking.id).concat(modelKeys(ranking.name))
+        const candidates = prices.filter(price => providerIds.has(price.providerId) && keys.includes(price.modelKey))
+        const price = candidates.sort((a, b) => Math.abs(a.modelKey.length - keys[0].length) - Math.abs(b.modelKey.length - keys[0].length))[0]
+        const mergeKey = price ? `${price.providerId}:${price.modelKey}` : `${ranking.creator}:${modelKeys(ranking.name)[0]}`
+        if (!price || used.has(mergeKey)) return []
+        used.add(mergeKey)
+        return [{ id: ranking.id, name: ranking.name.replaceAll(/\s*\([^)]*\)/g, '').trim(), company: ranking.creator, family: ranking.creator, accent: ranking.accent, providerIconUrl: price.providerIconUrl, priceSource: '官方价格', score: ranking.score, inputPrice: price.inputPrice, outputPrice: price.outputPrice, cachedInputPrice: price.cachedInputPrice, reasoning: ranking.reasoning, openWeights: ranking.openWeights, sourceUrl: price.sourceUrl }]
+      })
+      const latest = await database.prepare('SELECT model_count AS modelCount, provider_count AS providerCount, synced_at AS syncedAt, source_url AS sourceUrl FROM model_price_syncs ORDER BY id DESC LIMIT 1').get() ?? null
       return json(response, 200, { models, latest })
     }
 
@@ -249,8 +254,8 @@ function authPlugin(clientId: string, clientSecret: string, googleClientId: stri
         if (!/^[\p{L}\p{N}_-]{2,24}$/u.test(username)) return json(response, 400, { error: '用户名需为 2–24 个字符，可使用文字、数字、_ 或 -' })
         if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return json(response, 400, { error: '请输入有效邮箱地址' })
         if (password.length < 8 || password.length > 128) return json(response, 400, { error: '密码长度需为 8–128 位' })
-        const result = database.prepare('INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)').run(username, email, passwordHash(password))
-        const registeredUser = localUser({ id: result.lastInsertRowid, username, role: 'user' })
+        const result = await database.prepare('INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)').run(username, email, passwordHash(password))
+        const registeredUser = localUser({ id: result.insertId, username, role: 'user' })
         createSession(response, registeredUser)
         return json(response, 201, { user: registeredUser })
       } catch (error) {
@@ -268,7 +273,7 @@ function authPlugin(clientId: string, clientSecret: string, googleClientId: stri
         if (body.acceptedTerms !== true) return json(response, 400, { error: '请先阅读并同意用户协议和隐私条款' })
         if (!captcha?.verified || captcha.expiresAt < Date.now()) return json(response, 400, { error: '请先完成滑动拼图验证' })
         captchaChallenges.delete(captchaId)
-        const row = database.prepare('SELECT id, username, password_hash, role FROM users WHERE username = ? COLLATE NOCASE OR email = ? COLLATE NOCASE').get(account, account) as Record<string, unknown> | undefined
+        const row = await database.prepare('SELECT id, username, password_hash, role FROM users WHERE username = ? OR email = ?').get(account, account) as Record<string, unknown> | undefined
         if (!row || !passwordMatches(password, String(row.password_hash))) return json(response, 401, { error: '账号或密码错误' })
         const signedInUser = localUser(row)
         createSession(response, signedInUser)
@@ -357,17 +362,17 @@ function authPlugin(clientId: string, clientSecret: string, googleClientId: stri
         const submission = await readJson(request)
         const required = ['name', 'website', 'models', 'pricing']
         if (required.some(field => typeof submission[field] !== 'string' || !(submission[field] as string).trim())) return json(response, 400, { error: '请完整填写必填信息' })
-        const localAccount = database.prepare('SELECT id FROM users WHERE username = ? COLLATE NOCASE').get(user.login) as { id: number } | undefined
-        const result = database.prepare('INSERT INTO submissions (user_id, submitter_login, name, website, models, pricing, notes) VALUES (?, ?, ?, ?, ?, ?, ?)').run(localAccount?.id ?? null, user.login, String(submission.name).trim(), String(submission.website).trim(), String(submission.models).trim(), String(submission.pricing).trim(), String(submission.notes ?? '').trim())
-        return json(response, 201, { ok: true, id: Number(result.lastInsertRowid) })
+        const localAccount = await database.prepare('SELECT id FROM users WHERE username = ?').get(user.login) as { id: number } | undefined
+        const result = await database.prepare('INSERT INTO submissions (user_id, submitter_login, name, website, models, pricing, notes) VALUES (?, ?, ?, ?, ?, ?, ?)').run(localAccount?.id ?? null, user.login, String(submission.name).trim(), String(submission.website).trim(), String(submission.models).trim(), String(submission.pricing).trim(), String(submission.notes ?? '').trim())
+        return json(response, 201, { ok: true, id: Number(result.insertId) })
       } catch (error) {
         return json(response, 400, { error: error instanceof Error ? error.message : '提交格式无效' })
       }
     }
     if (url.pathname === '/api/user/sites' && request.method === 'GET') {
       if (!user) return json(response, 401, { error: '请先登录' })
-      const localAccount = database.prepare('SELECT id FROM users WHERE username = ? COLLATE NOCASE').get(user.login) as { id: number } | undefined
-      const sites = localAccount ? database.prepare(`SELECT submissions.id, submissions.name, submissions.website, submissions.models, submissions.pricing, submissions.status, submissions.review_note, submissions.created_at, managed_providers.active
+      const localAccount = await database.prepare('SELECT id FROM users WHERE username = ?').get(user.login) as { id: number } | undefined
+      const sites = localAccount ? await database.prepare(`SELECT submissions.id, submissions.name, submissions.website, submissions.models, submissions.pricing, submissions.status, submissions.review_note, submissions.created_at, managed_providers.active
         FROM submissions LEFT JOIN managed_providers ON managed_providers.submission_id = submissions.id WHERE submissions.user_id = ? ORDER BY submissions.created_at DESC`).all(localAccount.id) : []
       const stats = { total: sites.length, pending: sites.filter(site => (site as { status: string }).status === 'pending').length, approved: sites.filter(site => (site as { status: string }).status === 'approved').length }
       return json(response, 200, { sites, stats })
@@ -375,73 +380,73 @@ function authPlugin(clientId: string, clientSecret: string, googleClientId: stri
     if (url.pathname.startsWith('/api/admin/')) {
       if (!user) return json(response, 401, { error: '请先登录' })
       if (user.role !== 'admin') return json(response, 403, { error: '无权访问管理员后台' })
-      const adminAccount = database.prepare('SELECT id FROM users WHERE username = ? COLLATE NOCASE AND role = \'admin\'').get(user.login) as { id: number } | undefined
+      const adminAccount = await database.prepare('SELECT id FROM users WHERE username = ? AND role = \'admin\'').get(user.login) as { id: number } | undefined
       if (!adminAccount) return json(response, 403, { error: '管理员身份已失效，请重新登录' })
-      const log = (action: string, targetType: string, targetId: number | null, details = '') => database.prepare('INSERT INTO audit_logs (admin_id, action, target_type, target_id, details) VALUES (?, ?, ?, ?, ?)').run(adminAccount.id, action, targetType, targetId, details)
+      const log = async (action: string, targetType: string, targetId: number | null, details = '') => await database.prepare('INSERT INTO audit_logs (admin_id, action, target_type, target_id, details) VALUES (?, ?, ?, ?, ?)').run(adminAccount.id, action, targetType, targetId, details)
 
       if (url.pathname === '/api/admin/model-rankings/sync' && request.method === 'POST') {
         try {
           const result = await syncModelRankings()
-          log('model-rankings.sync', 'model-ranking', null, `${result.count} models from ${LEADERBOARD_URL}`)
+          await log('model-rankings.sync', 'model-ranking', null, `${result.count} models from ${LEADERBOARD_URL}`)
           return json(response, 200, { ok: true, ...result })
         } catch (error) {
           return json(response, 502, { error: error instanceof Error ? error.message : '排行榜同步失败' })
         }
       }
       if (url.pathname === '/api/admin/dashboard' && request.method === 'GET') {
-        const counts = database.prepare("SELECT (SELECT COUNT(*) FROM submissions WHERE status = 'pending') AS pending, (SELECT COUNT(*) FROM managed_providers WHERE active = 1) AS providers, (SELECT COUNT(*) FROM users) AS users, (SELECT COUNT(*) FROM audit_logs) AS logs").get()
+        const counts = await database.prepare("SELECT (SELECT COUNT(*) FROM submissions WHERE status = 'pending') AS pending, (SELECT COUNT(*) FROM managed_providers WHERE active = 1) AS providers, (SELECT COUNT(*) FROM users) AS users, (SELECT COUNT(*) FROM audit_logs) AS logs").get()
         return json(response, 200, { counts })
       }
-      if (url.pathname === '/api/admin/submissions' && request.method === 'GET') return json(response, 200, { submissions: database.prepare('SELECT * FROM submissions ORDER BY created_at DESC').all() })
+      if (url.pathname === '/api/admin/submissions' && request.method === 'GET') return json(response, 200, { submissions: await database.prepare('SELECT * FROM submissions ORDER BY created_at DESC').all() })
       const submissionMatch = url.pathname.match(/^\/api\/admin\/submissions\/(\d+)$/)
       if (submissionMatch && request.method === 'PATCH') {
         const body = await readJson(request)
         const status = String(body.status ?? '')
         if (!['approved', 'rejected'].includes(status)) return json(response, 400, { error: '审核状态无效' })
         const id = Number(submissionMatch[1])
-        const existing = database.prepare('SELECT * FROM submissions WHERE id = ?').get(id) as Record<string, unknown> | undefined
+        const existing = await database.prepare('SELECT * FROM submissions WHERE id = ?').get(id) as Record<string, unknown> | undefined
         if (!existing) return json(response, 404, { error: '提交记录不存在' })
-        database.prepare('UPDATE submissions SET status = ?, review_note = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(status, String(body.review_note ?? '').trim(), id)
-        if (status === 'approved') database.prepare('INSERT INTO managed_providers (submission_id, name, website, models, pricing, notes) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(submission_id) DO UPDATE SET name = excluded.name, website = excluded.website, models = excluded.models, pricing = excluded.pricing, notes = excluded.notes, active = 1').run(id, String(existing.name), String(existing.website), String(existing.models), String(existing.pricing), String(existing.notes))
-        log(`submission.${status}`, 'submission', id, String(body.review_note ?? '').trim())
+        await database.prepare('UPDATE submissions SET status = ?, review_note = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(status, String(body.review_note ?? '').trim(), id)
+        if (status === 'approved') await database.prepare('INSERT INTO managed_providers (submission_id, name, website, models, pricing, notes) VALUES (?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE name = VALUES(name), website = VALUES(website), models = VALUES(models), pricing = VALUES(pricing), notes = VALUES(notes), active = 1').run(id, String(existing.name), String(existing.website), String(existing.models), String(existing.pricing), String(existing.notes))
+        await log(`submission.${status}`, 'submission', id, String(body.review_note ?? '').trim())
         return json(response, 200, { ok: true })
       }
-      if (url.pathname === '/api/admin/providers' && request.method === 'GET') return json(response, 200, { providers: database.prepare('SELECT * FROM managed_providers ORDER BY created_at DESC').all() })
+      if (url.pathname === '/api/admin/providers' && request.method === 'GET') return json(response, 200, { providers: await database.prepare('SELECT * FROM managed_providers ORDER BY created_at DESC').all() })
       if (url.pathname === '/api/admin/providers' && request.method === 'POST') {
         const body = await readJson(request)
         if (!body.name || !body.website || !body.models || !body.pricing) return json(response, 400, { error: '请完整填写站点信息' })
-        const result = database.prepare('INSERT INTO managed_providers (name, website, models, pricing, notes) VALUES (?, ?, ?, ?, ?)').run(String(body.name).trim(), String(body.website).trim(), String(body.models).trim(), String(body.pricing).trim(), String(body.notes ?? '').trim())
-        log('provider.create', 'provider', Number(result.lastInsertRowid), String(body.name))
+        const result = await database.prepare('INSERT INTO managed_providers (name, website, models, pricing, notes) VALUES (?, ?, ?, ?, ?)').run(String(body.name).trim(), String(body.website).trim(), String(body.models).trim(), String(body.pricing).trim(), String(body.notes ?? '').trim())
+        await log('provider.create', 'provider', Number(result.insertId), String(body.name))
         return json(response, 201, { ok: true })
       }
       const providerMatch = url.pathname.match(/^\/api\/admin\/providers\/(\d+)$/)
       if (providerMatch && request.method === 'PATCH') {
         const body = await readJson(request); const id = Number(providerMatch[1])
-        const existing = database.prepare('SELECT * FROM managed_providers WHERE id = ?').get(id) as Record<string, unknown> | undefined
+        const existing = await database.prepare('SELECT * FROM managed_providers WHERE id = ?').get(id) as Record<string, unknown> | undefined
         if (!existing) return json(response, 404, { error: '站点不存在' })
-        database.prepare('UPDATE managed_providers SET name = ?, website = ?, models = ?, pricing = ?, notes = ?, active = ? WHERE id = ?').run(String(body.name ?? existing.name).trim(), String(body.website ?? existing.website).trim(), String(body.models ?? existing.models).trim(), String(body.pricing ?? existing.pricing).trim(), String(body.notes ?? existing.notes).trim(), body.active === undefined ? Number(existing.active) : body.active ? 1 : 0, id)
-        log('provider.update', 'provider', id)
+        await database.prepare('UPDATE managed_providers SET name = ?, website = ?, models = ?, pricing = ?, notes = ?, active = ? WHERE id = ?').run(String(body.name ?? existing.name).trim(), String(body.website ?? existing.website).trim(), String(body.models ?? existing.models).trim(), String(body.pricing ?? existing.pricing).trim(), String(body.notes ?? existing.notes).trim(), body.active === undefined ? Number(existing.active) : body.active ? 1 : 0, id)
+        await log('provider.update', 'provider', id)
         return json(response, 200, { ok: true })
       }
       if (providerMatch && request.method === 'DELETE') {
-        const id = Number(providerMatch[1]); database.prepare('DELETE FROM managed_providers WHERE id = ?').run(id); log('provider.delete', 'provider', id)
+        const id = Number(providerMatch[1]); await database.prepare('DELETE FROM managed_providers WHERE id = ?').run(id); await log('provider.delete', 'provider', id)
         return json(response, 200, { ok: true })
       }
-      if (url.pathname === '/api/admin/users' && request.method === 'GET') return json(response, 200, { users: database.prepare('SELECT id, username, email, role, created_at FROM users ORDER BY created_at DESC').all() })
+      if (url.pathname === '/api/admin/users' && request.method === 'GET') return json(response, 200, { users: await database.prepare('SELECT id, username, email, role, created_at FROM users ORDER BY created_at DESC').all() })
       const userMatch = url.pathname.match(/^\/api\/admin\/users\/(\d+)$/)
       if (userMatch && request.method === 'PATCH') {
         const body = await readJson(request); const id = Number(userMatch[1]); const role = String(body.role ?? '')
         if (!['user', 'admin'].includes(role)) return json(response, 400, { error: '角色无效' })
-        const target = database.prepare('SELECT id, role FROM users WHERE id = ?').get(id) as { id: number; role: string } | undefined
+        const target = await database.prepare('SELECT id, role FROM users WHERE id = ?').get(id) as { id: number; role: string } | undefined
         if (!target) return json(response, 404, { error: '用户不存在' })
         if (target.role === 'admin' && role === 'user') {
-          const adminCount = database.prepare("SELECT COUNT(*) AS count FROM users WHERE role = 'admin'").get() as { count: number }
+          const adminCount = await database.prepare("SELECT COUNT(*) AS count FROM users WHERE role = 'admin'").get() as { count: number }
           if (adminCount.count <= 1) return json(response, 409, { error: '不能移除唯一管理员的权限' })
         }
-        database.prepare('UPDATE users SET role = ? WHERE id = ?').run(role, id); log('user.role', 'user', id, role)
+        await database.prepare('UPDATE users SET role = ? WHERE id = ?').run(role, id); await log('user.role', 'user', id, role)
         return json(response, 200, { ok: true })
       }
-      if (url.pathname === '/api/admin/audit-logs' && request.method === 'GET') return json(response, 200, { logs: database.prepare('SELECT audit_logs.*, users.username AS admin_name FROM audit_logs JOIN users ON users.id = audit_logs.admin_id ORDER BY audit_logs.created_at DESC LIMIT 200').all() })
+      if (url.pathname === '/api/admin/audit-logs' && request.method === 'GET') return json(response, 200, { logs: await database.prepare('SELECT audit_logs.*, users.username AS admin_name FROM audit_logs JOIN users ON users.id = audit_logs.admin_id ORDER BY audit_logs.created_at DESC LIMIT 200').all() })
     }
     return json(response, 404, { error: '接口不存在' })
   }) }
@@ -451,5 +456,5 @@ function authPlugin(clientId: string, clientSecret: string, googleClientId: stri
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
-  return { plugins: [react(), groupProbePlugin(), authPlugin(env.GITHUB_CLIENT_ID, env.GITHUB_CLIENT_SECRET, env.GOOGLE_CLIENT_ID, env.GOOGLE_CLIENT_SECRET)] }
+  return { plugins: [react(), groupProbePlugin(), authPlugin(env.GITHUB_CLIENT_ID, env.GITHUB_CLIENT_SECRET, env.GOOGLE_CLIENT_ID, env.GOOGLE_CLIENT_SECRET, env.DATABASE_URL)] }
 })

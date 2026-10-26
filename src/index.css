@@ -1,11 +1,40 @@
 @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@500;600;700;800&family=Noto+Sans+SC:wght@400;500;600;700;800&display=swap');
 
-:root { font-family: 'Noto Sans SC', sans-serif; color: #172033; background: #f8faff; font-synthesis: none; text-rendering: optimizeLegibility; --primary:#625bf6; --primary-dark:#4c45d9; --ink:#172033; --muted:#697386; --line:#e5e9f2; }
+:root {
+  font-family: 'Noto Sans SC', sans-serif;
+  color: #172033;
+  background: #f8faff;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  --primary: #625bf6;
+  --primary-dark: #4c45d9;
+  --primary-soft: #efefff;
+  --primary-border: #cbc7ff;
+  --ink: #172033;
+  --heading: #161d2e;
+  --text-secondary: #566074;
+  --muted: #697386;
+  --text-light: #929aaa;
+  --line: #e5e9f2;
+  --line-soft: #eef0f5;
+  --surface: #fff;
+  --page-bg: #f8faff;
+  --surface-muted: #fafbfc;
+  --shadow-card: 0 8px 28px rgba(35, 47, 77, 0.06);
+  --shadow-raised: 0 14px 35px rgba(35, 47, 77, 0.09);
+  --shadow-primary: 0 10px 24px rgba(98, 91, 246, 0.2);
+  --shadow-dialog: 0 25px 80px rgba(20, 25, 50, 0.28);
+}
 * { box-sizing: border-box; }
 html { scroll-behavior: smooth; }
-body { margin: 0; min-width: 320px; min-height: 100vh; }
-button, input, textarea { font: inherit; }
+body { margin: 0; min-width: 320px; min-height: 100vh; background: var(--page-bg); font-size: 16px; line-height: 1.65; }
+button, input, textarea, select { font: inherit; }
 button, a { -webkit-tap-highlight-color: transparent; }
 a { color: inherit; text-decoration: none; }
 button { cursor: pointer; }
+:where(a, button, input, textarea, select):focus-visible { outline: 3px solid rgba(98, 91, 246, 0.28); outline-offset: 2px; }
 #root { min-height: 100vh; }
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+}

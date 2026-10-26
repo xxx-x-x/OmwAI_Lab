@@ -7,11 +7,15 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "db:migrate": "node --env-file=.env --experimental-strip-types scripts/migrate-sqlite-to-mysql.ts",
+    "db:sync-rankings": "node --env-file=.env --experimental-strip-types scripts/sync-model-rankings.ts",
+    "db:sync-prices": "node --env-file=.env --experimental-strip-types scripts/sync-model-prices.ts"
   },
   "dependencies": {
     "@lobehub/icons": "^6.13.0",
     "lucide-react": "^1.61.0",
+    "mysql2": "^3.24.6",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
     "react-router-dom": "^7.18.4"
