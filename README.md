@@ -18,6 +18,7 @@
 | 服务商 | 支持模型 / 厂商 | 价格说明 | 主推分组及倍率 | 官网 | 补充说明 |
 | --- | --- | --- | --- | --- | --- |
 | OmwAI | OpenAI、Claude | 1:1 | 企业级不降智：0.25 | https://www.omwai.xyz | 用户分组倍率：白银 0.96，黄金 0.94 |
+| Twinkle Model | OpenAI、Claude、Grok 等 | 按官方价 × 分组倍率计费（每百万 tokens）；生图 0.1 元/次 | GPT 特价 0.1 / 稳定 0.2；Claude Kiro 高缓 0.15 / CC-MAX 满血 1；Grok 0.15 | https://big-model.smart-agi.com/ | 基于 sub2api，官方订阅渠道；GLM、DeepSeek、Kimi 1 折 / 6 折；支付宝 ¥1 起充，可开发票；运营者自荐 |
 
 ## 收录字段
 
