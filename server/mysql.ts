@@ -62,6 +62,12 @@ export async function initializeDatabase(database: Database) {
   if (!priceColumns.some(column => column.Field === 'source_id')) {
     await database.run("ALTER TABLE model_prices ADD COLUMN source_id VARCHAR(100) NOT NULL DEFAULT 'official' FIRST, DROP PRIMARY KEY, ADD PRIMARY KEY(source_id, provider_id, model_id)")
   }
+  if (!priceColumns.some(column => column.Field === 'capability_metadata')) {
+    await database.run('ALTER TABLE model_prices ADD COLUMN capability_metadata TEXT NULL')
+  }
+  if (!priceColumns.some(column => column.Field === 'release_date')) {
+    await database.run('ALTER TABLE model_prices ADD COLUMN release_date VARCHAR(10) NULL AFTER provider_name')
+  }
   if (!priceColumns.some(column => column.Field === 'provider_icon_url')) {
     await database.run("ALTER TABLE model_prices ADD COLUMN provider_icon_url VARCHAR(2048) NOT NULL DEFAULT '' AFTER provider_name")
   }

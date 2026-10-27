@@ -15,10 +15,18 @@
 
 价格和模型信息以服务商公开页面为准。无法从公开来源确认的内容标记为“未说明”，不根据宣传语推断。
 
+模型定价页独立于模型能力排行榜：型号与报价从 BaseLLM LLM Metadata 同步，美元报价保持原值；额外收录火山引擎（Volcengine Ark）的非弃用按量计费模型，将其人民币输入、输出及缓存读取价格按固定汇率 **1 USD = 6.67 CNY** 除以 6.67 换算为美元（非官方美元报价，不使用实时汇率），不收录 Coding Plan 订阅。另外在 `server/volcengine-media-prices.ts` 维护直接核对火山引擎官方价格页的 Seedream 图片及 Seedance 视频在线推理报价（核对日期 2026-10-27），由价格 API 合并返回，不依赖 BaseLLM 是否收录多模态模型。Seedream 按张图片计费，Seedance 按百万视频 Tokens 计费；API 保留输入视频、分辨率、图片像素与图层拆分等分档条件，页面仅展示基础单价，不显示“计费条件与分档”折叠区，不将官方示例每秒价格误作统一单价。更新报价时应同时修改核对日期与测试。页面来源链接指向火山引擎官方模型价格页，顶部筛选及“厂商”列使用厂商 Logo（位于名称左侧），豆包 Seed、Seedream、Seedance 模型名称左侧使用豆包模型 Logo。豆包型号按官方价格页原文显示，如 `doubao-seed-2.0-lite`、`doubao-seedream-5-0-pro`、`doubao-seedance-2.0`，不自行添加中文品牌前缀或改写版本分隔符。模型按厂商和基础型号合并日期、预览与推理模式版本；不同服务商的报价分别展示。缓存读取价格取自 BaseLLM 的 `cost.cache_read`（美元 / 百万 Tokens），不使用缓存写入价格或普通输入价格补缺；数据库沿用 `cached_input_price` 列存储该值，API 使用 `cacheReadPrice` 字段返回。没有报价的型号保留并显示“—”，不使用排行榜价格补缺。定价页不展示 Arcee、Cohere、Inception、Mistral、Morph、Nova、Poolside、Sakana AI、Sarvam AI、StepFun (Global)、Thinking Machines 和 Upstage 的模型；此过滤仅作用于定价页。
+
 | 服务商 | 支持模型 / 厂商 | 价格说明 | 主推分组及倍率 | 官网 | 补充说明 |
 | --- | --- | --- | --- | --- | --- |
 | OmwAI | OpenAI、Claude | 1:1 | 企业级不降智：0.25 | https://www.omwai.xyz | 用户分组倍率：白银 0.96，黄金 0.94 |
 | Twinkle Model | OpenAI、Claude、Grok 等 | 按官方价 × 分组倍率计费（每百万 tokens）；生图 0.1 元/次 | GPT 特价 0.1 / 稳定 0.2；Claude Kiro 高缓 0.15 / CC-MAX 满血 1；Grok 0.15 | https://big-model.smart-agi.com/ | 基于 sub2api，官方订阅渠道；GLM、DeepSeek、Kimi 1 折 / 6 折；支付宝 ¥1 起充，可开发票；运营者自荐 |
+
+`server/openai-prices.ts` 补充 OpenAI 官方新发布型号，价格 API 按厂商与模型 ID 覆盖上游同名条目，避免尚未同步时缺失或重复。GPT-6.1 Terra 发布日期为 2026-10-27（同日核对），标准输入 / 输出 / 缓存读取价分别为 $1 / $5 / $0.05 每百万 Tokens，来源为 [OpenAI 官方模型文档](https://developers.openai.com/api/docs/models/gpt-6.1-terra)。API 详情保留缓存写入、超过 272K 输入 Tokens 的阶梯倍率及 Batch/Flex、Fast、区域处理计价，页面不展示分档详情；后续更新须同时修改核对日期与测试。
+
+定价表格的“模型能力”列按源数据展示多个标签：对话、深度思考、识图、语音、视频理解、图片生成、视频生成、长文本，不再混入“开源”或“通用”。同步时将 BaseLLM 的 `type`、`modalities` 和 `limit` 保存到 `capability_metadata`；长文本标准为上下文窗口 ≥ 200,000 Tokens，悬停标签显示实际 Tokens 数。识图与视频理解要求对应输入模态及文本输出，生成模型单独标注生成能力；未确认的能力不按名称推测。旧数据需运行 `npm run db:sync-prices` 补齐元数据；缺失元数据的历史文本模型仅回退显示对话及已有的深度思考标记，无法分类时显示“未说明”。
+
+定价表格的“模型ID”列显示 API 的 `modelId`（所保留型号的原始模型 ID），保留日期后缀及版本分隔符，不添加厂商前缀或用显示名称替代；搜索支持模型 ID、名称与厂商，方便后续与中转站 `/models` 接口返回的 ID 对照。现有基础型号合并规则不变，未保留的版本 ID 不单独展示。模型公司列同时显示厂商 Logo 和名称；移除价格来源列，来源链接统一保留在页面底部说明区域。新增的发布时间列读取 BaseLLM `release_date`，持久化到数据库同名列，并通过 API `releaseDate` 返回。显示所保留默认型号的发布日期，不使用价格核对日期或同步时间代替；缺失时显示“—”。
 
 ## 收录字段
 

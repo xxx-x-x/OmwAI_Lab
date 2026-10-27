@@ -1,5 +1,5 @@
 const CREATOR_PROVIDER_ALIASES: Record<string, string[]> = {
-  Alibaba: ['alibaba'], Anthropic: ['anthropic'], Cohere: ['cohere'], DeepSeek: ['deepseek'], Google: ['google'], Inception: ['inception'], Kimi: ['moonshotai'], LongCat: ['longcat'], Meta: ['meta'], MiniMax: ['minimax'], Mistral: ['mistral'], OpenAI: ['openai'], Perplexity: ['perplexity'], Sarvam: ['sarvam'], SpaceXAI: ['xai'], StepFun: ['stepfun-ai'], 'Thinking Machines': ['thinkingmachines'], Upstage: ['upstage'], Xiaomi: ['xiaomi'], 'Z AI': ['zai'],
+  Alibaba: ['alibaba'], Anthropic: ['anthropic'], Cohere: ['cohere'], DeepSeek: ['deepseek'], Google: ['google'], Inception: ['inception'], Kimi: ['moonshotai'], LongCat: ['longcat'], Meta: ['meta'], MiniMax: ['minimax'], Mistral: ['mistral'], OpenAI: ['openai'], Perplexity: ['perplexity'], Sarvam: ['sarvam'], SpaceXAI: ['xai'], StepFun: ['stepfun-ai'], 'Thinking Machines': ['thinkingmachines'], Upstage: ['upstage'], Xiaomi: ['xiaomi'], 'Z AI': ['zai'], 'Zhipu AI': ['zai'],
 }
 
 export function providerIdsForCreator(creator: string) {

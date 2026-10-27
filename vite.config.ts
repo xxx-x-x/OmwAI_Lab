@@ -5,7 +5,9 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import react from '@vitejs/plugin-react'
 import { defineConfig, loadEnv, type Plugin, type PreviewServer, type ViteDevServer } from 'vite'
 import { createDatabase, initializeDatabase, type DatabaseRow } from './server/mysql.js'
-import { modelKeys, providerIdsForCreator } from './server/model-key.js'
+import { mergePrices, type PriceRow } from './server/pricing.js'
+import { volcengineMediaPrices } from './server/volcengine-media-prices.js'
+import { withOpenaiPrices } from './server/openai-prices.js'
 
 const MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 const PROBE_TIMEOUT_MS = 10_000
@@ -204,21 +206,8 @@ function authPlugin(clientId: string, clientSecret: string, googleClientId: stri
       return json(response, 200, { models, latest })
     }
     if (url.pathname === '/api/model-prices' && request.method === 'GET') {
-      type RankingPriceRow = DatabaseRow & { id: string; name: string; creator: string; accent: string; score: number; reasoning: number; openWeights: number }
-      type OfficialPriceRow = DatabaseRow & { providerId: string; modelId: string; modelKey: string; providerIconUrl: string; inputPrice: number | null; outputPrice: number | null; cachedInputPrice: number | null; sourceUrl: string }
-      const rankings = await database.prepare(`SELECT slug AS id, name, creator, creator_color AS accent, intelligence_index AS score, is_reasoning AS reasoning, is_open_weights AS openWeights FROM model_rankings WHERE deprecated = 0 AND intelligence_index IS NOT NULL ORDER BY intelligence_index DESC`).all<RankingPriceRow>()
-      const prices = await database.prepare("SELECT provider_id AS providerId, model_id AS modelId, model_key AS modelKey, provider_icon_url AS providerIconUrl, input_price AS inputPrice, output_price AS outputPrice, cached_input_price AS cachedInputPrice, source_url AS sourceUrl FROM model_prices WHERE source_id = 'official'").all<OfficialPriceRow>()
-      const used = new Set<string>()
-      const models = rankings.flatMap(ranking => {
-        const providerIds = new Set(providerIdsForCreator(ranking.creator))
-        const keys = modelKeys(ranking.id).concat(modelKeys(ranking.name))
-        const candidates = prices.filter(price => providerIds.has(price.providerId) && keys.includes(price.modelKey))
-        const price = candidates.sort((a, b) => Math.abs(a.modelKey.length - keys[0].length) - Math.abs(b.modelKey.length - keys[0].length))[0]
-        const mergeKey = price ? `${price.providerId}:${price.modelKey}` : `${ranking.creator}:${modelKeys(ranking.name)[0]}`
-        if (!price || used.has(mergeKey)) return []
-        used.add(mergeKey)
-        return [{ id: ranking.id, name: ranking.name.replaceAll(/\s*\([^)]*\)/g, '').trim(), company: ranking.creator, family: ranking.creator, accent: ranking.accent, providerIconUrl: price.providerIconUrl, priceSource: '官方价格', score: ranking.score, inputPrice: price.inputPrice, outputPrice: price.outputPrice, cachedInputPrice: price.cachedInputPrice, reasoning: ranking.reasoning, openWeights: ranking.openWeights, sourceUrl: price.sourceUrl }]
-      })
+      const prices = await database.prepare("SELECT provider_id AS providerId, model_id AS modelId, name, provider_name AS providerName, provider_icon_url AS providerIconUrl, release_date AS releaseDate, capability_metadata AS capabilityMetadata, reasoning, open_weights AS openWeights, input_price AS inputPrice, output_price AS outputPrice, cached_input_price AS cacheReadPrice, source_url AS sourceUrl FROM model_prices WHERE source_id = 'official'").all<DatabaseRow & PriceRow>()
+      const models = mergePrices([...withOpenaiPrices(prices), ...volcengineMediaPrices])
       const latest = await database.prepare('SELECT model_count AS modelCount, provider_count AS providerCount, synced_at AS syncedAt, source_url AS sourceUrl FROM model_price_syncs ORDER BY id DESC LIMIT 1').get() ?? null
       return json(response, 200, { models, latest })
     }
