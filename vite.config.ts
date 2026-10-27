@@ -8,13 +8,14 @@ import { createDatabase, initializeDatabase, type DatabaseRow } from './server/m
 import { mergePrices, type PriceRow } from './server/pricing.js'
 import { volcengineMediaPrices } from './server/volcengine-media-prices.js'
 import { withOpenaiPrices } from './server/openai-prices.js'
+import { handleSiteGroups } from './server/site-groups.js'
 
 const MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 const PROBE_TIMEOUT_MS = 10_000
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000
 
 type AuthUser = { id: number; login: string; name: string | null; avatar_url: string; html_url: string; role: 'user' | 'admin' }
-type Session = { user: AuthUser; expiresAt: number }
+type Session = { user: AuthUser; expiresAt: number; localUserId: number | null }
 type CaptchaChallenge = { target: number; expiresAt: number; verified: boolean }
 type SourceModel = Record<string, unknown>
 
@@ -169,7 +170,7 @@ function groupProbePlugin(): Plugin {
   }
 }
 
-function authPlugin(clientId: string, clientSecret: string, googleClientId: string, googleClientSecret: string, databaseUrl: string): Plugin {
+function authPlugin(clientId: string, clientSecret: string, googleClientId: string, googleClientSecret: string, databaseUrl: string, siteKey: string): Plugin {
   const database = createDatabase(databaseUrl)
   let ready: Promise<void> | undefined
   const syncModelRankings = async () => {
@@ -188,9 +189,9 @@ function authPlugin(clientId: string, clientSecret: string, googleClientId: stri
   const sessions = new Map<string, Session>()
   const oauthStates = new Map<string, number>()
   const captchaChallenges = new Map<string, CaptchaChallenge>()
-  const createSession = (response: ServerResponse, user: AuthUser) => {
+  const createSession = (response: ServerResponse, user: AuthUser, localUserId: number | null = null) => {
     const id = randomBytes(32).toString('hex')
-    sessions.set(id, { user, expiresAt: Date.now() + SESSION_TTL_MS })
+    sessions.set(id, { user, localUserId, expiresAt: Date.now() + SESSION_TTL_MS })
     response.setHeader('set-cookie', `omwai_session=${id}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_TTL_MS / 1000}`)
   }
 
@@ -198,7 +199,7 @@ function authPlugin(clientId: string, clientSecret: string, googleClientId: stri
     ready ??= initializeDatabase(database)
     await ready
     const url = new URL(request.url ?? '/', 'http://localhost')
-    if (!url.pathname.startsWith('/api/auth/') && !url.pathname.startsWith('/api/submissions') && !url.pathname.startsWith('/api/admin/') && !url.pathname.startsWith('/api/user/') && !url.pathname.startsWith('/api/model-rankings') && !url.pathname.startsWith('/api/model-prices')) return next()
+    if (!url.pathname.startsWith('/api/auth/') && !url.pathname.startsWith('/api/submissions') && !url.pathname.startsWith('/api/admin/') && !url.pathname.startsWith('/api/user/') && !url.pathname.startsWith('/api/model-rankings') && !url.pathname.startsWith('/api/model-prices') && url.pathname !== '/api/site-comparison') return next()
 
     if (url.pathname === '/api/model-rankings' && request.method === 'GET') {
       const models = await database.prepare(`SELECT slug AS id, name, creator, creator_color AS color, creator_logo AS logo, context_window_tokens AS contextWindowTokens, intelligence_index AS score, intelligence_estimated AS scoreEstimated, cost_per_task AS costPerTask, input_price AS inputPrice, output_price AS outputPrice, median_tokens_per_second AS speed, latency_seconds AS latency, total_response_seconds AS totalResponse, is_reasoning AS reasoning, is_open_weights AS openWeights FROM model_rankings WHERE deprecated = 0 AND intelligence_index IS NOT NULL ORDER BY intelligence_index DESC`).all()
@@ -216,6 +217,12 @@ function authPlugin(clientId: string, clientSecret: string, googleClientId: stri
     const session = sessionId ? sessions.get(sessionId) : undefined
     const user = session && session.expiresAt > Date.now() ? session.user : null
     if (sessionId && !user) sessions.delete(sessionId)
+
+    if (url.pathname === '/api/site-comparison' || /^\/api\/user\/sites\/\d+\/(?:authorizations(?:\/[^/]+)?|quotes)$/.test(url.pathname) || /^\/api\/admin\/site-quotes(?:\/\d+)?$/.test(url.pathname)) {
+      const localUserId = user ? session?.localUserId ?? null : null
+      const admin = localUserId && user?.role === 'admin' ? await database.prepare("SELECT id FROM users WHERE id = ? AND role = 'admin'").get(localUserId) : null
+      return handleSiteGroups({ database, request, response, url, localUserId, adminId: admin ? localUserId : null, key: siteKey, readJson, json })
+    }
 
     if (url.pathname === '/api/auth/me' && request.method === 'GET') return json(response, 200, { user })
     if (url.pathname === '/api/auth/captcha' && request.method === 'POST') {
@@ -245,7 +252,7 @@ function authPlugin(clientId: string, clientSecret: string, googleClientId: stri
         if (password.length < 8 || password.length > 128) return json(response, 400, { error: '密码长度需为 8–128 位' })
         const result = await database.prepare('INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)').run(username, email, passwordHash(password))
         const registeredUser = localUser({ id: result.insertId, username, role: 'user' })
-        createSession(response, registeredUser)
+        createSession(response, registeredUser, Number(result.insertId))
         return json(response, 201, { user: registeredUser })
       } catch (error) {
         if (error instanceof Error && error.message.includes('UNIQUE')) return json(response, 409, { error: '用户名或邮箱已被注册' })
@@ -265,7 +272,7 @@ function authPlugin(clientId: string, clientSecret: string, googleClientId: stri
         const row = await database.prepare('SELECT id, username, password_hash, role FROM users WHERE username = ? OR email = ?').get(account, account) as Record<string, unknown> | undefined
         if (!row || !passwordMatches(password, String(row.password_hash))) return json(response, 401, { error: '账号或密码错误' })
         const signedInUser = localUser(row)
-        createSession(response, signedInUser)
+        createSession(response, signedInUser, signedInUser.id)
         return json(response, 200, { user: signedInUser })
       } catch {
         return json(response, 400, { error: '登录请求无效' })
@@ -351,8 +358,7 @@ function authPlugin(clientId: string, clientSecret: string, googleClientId: stri
         const submission = await readJson(request)
         const required = ['name', 'website', 'models', 'pricing']
         if (required.some(field => typeof submission[field] !== 'string' || !(submission[field] as string).trim())) return json(response, 400, { error: '请完整填写必填信息' })
-        const localAccount = await database.prepare('SELECT id FROM users WHERE username = ?').get(user.login) as { id: number } | undefined
-        const result = await database.prepare('INSERT INTO submissions (user_id, submitter_login, name, website, models, pricing, notes) VALUES (?, ?, ?, ?, ?, ?, ?)').run(localAccount?.id ?? null, user.login, String(submission.name).trim(), String(submission.website).trim(), String(submission.models).trim(), String(submission.pricing).trim(), String(submission.notes ?? '').trim())
+        const result = await database.prepare('INSERT INTO submissions (user_id, local_owner_verified, submitter_login, name, website, models, pricing, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(session?.localUserId ?? null, session?.localUserId ? 1 : 0, user.login, String(submission.name).trim(), String(submission.website).trim(), String(submission.models).trim(), String(submission.pricing).trim(), String(submission.notes ?? '').trim())
         return json(response, 201, { ok: true, id: Number(result.insertId) })
       } catch (error) {
         return json(response, 400, { error: error instanceof Error ? error.message : '提交格式无效' })
@@ -360,9 +366,9 @@ function authPlugin(clientId: string, clientSecret: string, googleClientId: stri
     }
     if (url.pathname === '/api/user/sites' && request.method === 'GET') {
       if (!user) return json(response, 401, { error: '请先登录' })
-      const localAccount = await database.prepare('SELECT id FROM users WHERE username = ?').get(user.login) as { id: number } | undefined
-      const sites = localAccount ? await database.prepare(`SELECT submissions.id, submissions.name, submissions.website, submissions.models, submissions.pricing, submissions.status, submissions.review_note, submissions.created_at, managed_providers.active
-        FROM submissions LEFT JOIN managed_providers ON managed_providers.submission_id = submissions.id WHERE submissions.user_id = ? ORDER BY submissions.created_at DESC`).all(localAccount.id) : []
+      const localUserId = session?.localUserId
+      const sites = localUserId ? await database.prepare(`SELECT submissions.id, submissions.name, submissions.website, submissions.models, submissions.pricing, submissions.status, submissions.review_note, submissions.created_at, managed_providers.active
+        FROM submissions LEFT JOIN managed_providers ON managed_providers.submission_id = submissions.id WHERE submissions.user_id = ? ORDER BY submissions.created_at DESC`).all(localUserId) : []
       const stats = { total: sites.length, pending: sites.filter(site => (site as { status: string }).status === 'pending').length, approved: sites.filter(site => (site as { status: string }).status === 'approved').length }
       return json(response, 200, { sites, stats })
     }
@@ -445,5 +451,5 @@ function authPlugin(clientId: string, clientSecret: string, googleClientId: stri
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
-  return { plugins: [react(), groupProbePlugin(), authPlugin(env.GITHUB_CLIENT_ID, env.GITHUB_CLIENT_SECRET, env.GOOGLE_CLIENT_ID, env.GOOGLE_CLIENT_SECRET, env.DATABASE_URL)] }
+  return { plugins: [react(), groupProbePlugin(), authPlugin(env.GITHUB_CLIENT_ID, env.GITHUB_CLIENT_SECRET, env.GOOGLE_CLIENT_ID, env.GOOGLE_CLIENT_SECRET, env.DATABASE_URL, env.SITE_CREDENTIAL_ENCRYPTION_KEY ?? '')] }
 })
