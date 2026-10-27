@@ -1,4 +1,4 @@
-import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto'
+import { createHash, randomBytes, randomInt, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto'
 import { lookup } from 'node:dns/promises'
 import { isIP } from 'node:net'
 import type { IncomingMessage, ServerResponse } from 'node:http'
@@ -9,14 +9,19 @@ import { mergePrices, type PriceRow } from './server/pricing.js'
 import { volcengineMediaPrices } from './server/volcengine-media-prices.js'
 import { withOpenaiPrices } from './server/openai-prices.js'
 import { handleSiteGroups } from './server/site-groups.js'
+import { createEmailService, type EmailConfig } from './server/email.js'
 
 const MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 const PROBE_TIMEOUT_MS = 10_000
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000
+const EMAIL_CODE_TTL_MS = 10 * 60 * 1000
+const EMAIL_CODE_COOLDOWN_MS = 60 * 1000
+const AUTH_WINDOW_MS = 15 * 60 * 1000
+const AUTH_WINDOW_LIMIT = 20
 
 type AuthUser = { id: number; login: string; name: string | null; avatar_url: string; html_url: string; role: 'user' | 'admin' }
 type Session = { user: AuthUser; expiresAt: number; localUserId: number | null }
-type CaptchaChallenge = { target: number; expiresAt: number; verified: boolean }
+type TurnstileResult = { success: boolean; action?: string; hostname?: string; 'error-codes'?: string[] }
 type SourceModel = Record<string, unknown>
 
 const LEADERBOARD_URL = 'https://artificialanalysis.ai/leaderboards/models'
@@ -35,6 +40,10 @@ async function fetchModelLeaderboard() {
   } catch {
     throw new Error('排行榜数据解析失败，源站格式可能已变更')
   }
+}
+
+function verificationCodeHash(email: string, purpose: string, code: string, secret: string) {
+  return createHash('sha256').update(`${email}:${purpose}:${code}:${secret}`).digest('hex')
 }
 
 function passwordHash(password: string, salt = randomBytes(16).toString('hex')) {
@@ -170,8 +179,9 @@ function groupProbePlugin(): Plugin {
   }
 }
 
-function authPlugin(clientId: string, clientSecret: string, googleClientId: string, googleClientSecret: string, databaseUrl: string, siteKey: string): Plugin {
+function authPlugin(clientId: string, clientSecret: string, googleClientId: string, googleClientSecret: string, databaseUrl: string, siteKey: string, emailConfig: EmailConfig, verificationSecret: string, secureCookies: boolean, turnstileSiteKey: string, turnstileSecretKey: string): Plugin {
   const database = createDatabase(databaseUrl)
+  const emailService = createEmailService(emailConfig)
   let ready: Promise<void> | undefined
   const syncModelRankings = async () => {
     const models = await fetchModelLeaderboard()
@@ -188,11 +198,41 @@ function authPlugin(clientId: string, clientSecret: string, googleClientId: stri
   }
   const sessions = new Map<string, Session>()
   const oauthStates = new Map<string, number>()
-  const captchaChallenges = new Map<string, CaptchaChallenge>()
+  const authRequests = new Map<string, { count: number; resetAt: number }>()
+  const allowAuthRequest = (request: IncomingMessage) => {
+    const forwarded = request.headers['x-forwarded-for']
+    const key = (Array.isArray(forwarded) ? forwarded[0] : forwarded?.split(',')[0])?.trim() || request.socket.remoteAddress || 'unknown'
+    const now = Date.now()
+    const entry = authRequests.get(key)
+    if (!entry || entry.resetAt <= now) { authRequests.set(key, { count: 1, resetAt: now + AUTH_WINDOW_MS }); return true }
+    entry.count += 1
+    return entry.count <= AUTH_WINDOW_LIMIT
+  }
+  const verifyTurnstile = async (request: IncomingMessage, token: unknown, expectedAction: string) => {
+    if (!turnstileSecretKey) return false
+    const value = String(token ?? '')
+    if (!value || value.length > 2048) return false
+    const forwarded = request.headers['cf-connecting-ip'] ?? request.headers['x-forwarded-for']
+    const remoteip = (Array.isArray(forwarded) ? forwarded[0] : forwarded?.split(',')[0])?.trim() || request.socket.remoteAddress
+    try {
+      const verification = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ secret: turnstileSecretKey, response: value, remoteip, idempotency_key: randomUUID() }),
+        signal: AbortSignal.timeout(10_000),
+      })
+      if (!verification.ok) return false
+      const result = await verification.json() as TurnstileResult
+      return result.success && result.action === expectedAction
+    } catch {
+      return false
+    }
+  }
+  const cookieSecurity = secureCookies ? '; Secure' : ''
   const createSession = (response: ServerResponse, user: AuthUser, localUserId: number | null = null) => {
     const id = randomBytes(32).toString('hex')
     sessions.set(id, { user, localUserId, expiresAt: Date.now() + SESSION_TTL_MS })
-    response.setHeader('set-cookie', `omwai_session=${id}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_TTL_MS / 1000}`)
+    response.setHeader('set-cookie', `omwai_session=${id}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_TTL_MS / 1000}${cookieSecurity}`)
   }
 
   const install = (server: ViteDevServer | PreviewServer) => { server.middlewares.use(async (request, response, next) => {
@@ -225,50 +265,70 @@ function authPlugin(clientId: string, clientSecret: string, googleClientId: stri
     }
 
     if (url.pathname === '/api/auth/me' && request.method === 'GET') return json(response, 200, { user })
-    if (url.pathname === '/api/auth/captcha' && request.method === 'POST') {
-      const id = randomBytes(24).toString('hex')
-      const target = 35 + Math.floor(Math.random() * 46)
-      captchaChallenges.set(id, { target, expiresAt: Date.now() + 5 * 60 * 1000, verified: false })
-      return json(response, 201, { id, target })
-    }
-    if (url.pathname === '/api/auth/captcha/verify' && request.method === 'POST') {
-      const body = await readJson(request)
-      const id = String(body.id ?? '')
-      const position = Number(body.position)
-      const challenge = captchaChallenges.get(id)
-      if (!challenge || challenge.expiresAt < Date.now()) { captchaChallenges.delete(id); return json(response, 400, { error: '验证已失效，请重试' }) }
-      if (!Number.isFinite(position) || Math.abs(position - challenge.target) > 3) { captchaChallenges.delete(id); return json(response, 400, { error: '拼图位置不正确，请重试' }) }
-      challenge.verified = true
-      return json(response, 200, { ok: true })
+    if (url.pathname === '/api/auth/turnstile-config' && request.method === 'GET') return json(response, turnstileSiteKey ? 200 : 503, turnstileSiteKey ? { siteKey: turnstileSiteKey } : { error: '人机验证尚未配置' })
+    if (url.pathname === '/api/auth/email-code' && request.method === 'POST') {
+      if (!allowAuthRequest(request)) return json(response, 429, { error: '请求过于频繁，请稍后再试' })
+      try {
+        if (!emailService.configured || !verificationSecret) return json(response, 503, { error: '邮件验证码服务尚未配置' })
+        const body = await readJson(request)
+        const email = String(body.email ?? '').trim().toLowerCase()
+        const purpose = String(body.purpose ?? '') as 'register' | 'reset-password'
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return json(response, 400, { error: '请输入有效邮箱地址' })
+        if (purpose !== 'register' && purpose !== 'reset-password') return json(response, 400, { error: '验证码用途无效' })
+        if (!await verifyTurnstile(request, body.turnstileToken, purpose === 'register' ? 'register' : 'reset_password')) return json(response, 400, { error: '人机验证失败或已过期，请重试' })
+        const existing = await database.prepare('SELECT id FROM users WHERE email = ?').get(email)
+        if (purpose === 'register' && existing) return json(response, 409, { error: '该邮箱已被注册' })
+        if (purpose === 'reset-password' && !existing) return json(response, 200, { ok: true, cooldown: EMAIL_CODE_COOLDOWN_MS / 1000 })
+        const latest = await database.prepare('SELECT created_at FROM email_verification_codes WHERE email = ? AND purpose = ? ORDER BY id DESC LIMIT 1').get(email, purpose) as { created_at?: Date | string } | undefined
+        if (latest?.created_at && Date.now() - new Date(latest.created_at).getTime() < EMAIL_CODE_COOLDOWN_MS) return json(response, 429, { error: '验证码发送过于频繁，请稍后再试' })
+        const code = randomInt(100000, 1000000).toString()
+        await emailService.sendVerificationCode(email, code, purpose)
+        await database.prepare('INSERT INTO email_verification_codes (email, purpose, code_hash, expires_at) VALUES (?, ?, ?, ?)').run(email, purpose, verificationCodeHash(email, purpose, code, verificationSecret), new Date(Date.now() + EMAIL_CODE_TTL_MS))
+        return json(response, 201, { ok: true, cooldown: EMAIL_CODE_COOLDOWN_MS / 1000 })
+      } catch (error) {
+        console.error('Failed to send verification email', error)
+        return json(response, 502, { error: '验证码发送失败，请稍后重试' })
+      }
     }
     if (url.pathname === '/api/auth/register' && request.method === 'POST') {
+      if (!allowAuthRequest(request)) return json(response, 429, { error: '请求过于频繁，请稍后再试' })
       try {
         const body = await readJson(request)
         const username = String(body.username ?? '').trim()
         const email = String(body.email ?? '').trim().toLowerCase()
         const password = String(body.password ?? '')
+        const code = String(body.code ?? '').trim()
+        if (!await verifyTurnstile(request, body.turnstileToken, 'register')) return json(response, 400, { error: '人机验证失败或已过期，请重试' })
         if (!/^[\p{L}\p{N}_-]{2,24}$/u.test(username)) return json(response, 400, { error: '用户名需为 2–24 个字符，可使用文字、数字、_ 或 -' })
         if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return json(response, 400, { error: '请输入有效邮箱地址' })
-        if (password.length < 8 || password.length > 128) return json(response, 400, { error: '密码长度需为 8–128 位' })
-        const result = await database.prepare('INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)').run(username, email, passwordHash(password))
+        if (password.length < 8 || password.length > 128 || !/[A-Za-z]/.test(password) || !/\d/.test(password)) return json(response, 400, { error: '密码需为 8–128 位，并同时包含字母和数字' })
+        if (!/^\d{6}$/.test(code)) return json(response, 400, { error: '请输入 6 位邮箱验证码' })
+        const verification = await database.prepare("SELECT id, code_hash, attempts FROM email_verification_codes WHERE email = ? AND purpose = 'register' AND consumed_at IS NULL AND expires_at > CURRENT_TIMESTAMP ORDER BY id DESC LIMIT 1").get(email) as { id: number; code_hash: string; attempts: number } | undefined
+        if (!verification || verification.attempts >= 5 || verification.code_hash !== verificationCodeHash(email, 'register', code, verificationSecret)) {
+          if (verification) await database.prepare('UPDATE email_verification_codes SET attempts = attempts + 1 WHERE id = ?').run(verification.id)
+          return json(response, 400, { error: '邮箱验证码错误或已失效' })
+        }
+        const result = await database.transaction(async connection => {
+          const inserted = await database.run('INSERT INTO users (username, email, password_hash, email_verified_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)', [username, email, passwordHash(password)], connection)
+          await database.run('UPDATE email_verification_codes SET consumed_at = CURRENT_TIMESTAMP WHERE id = ?', [verification.id], connection)
+          return inserted
+        })
         const registeredUser = localUser({ id: result.insertId, username, role: 'user' })
         createSession(response, registeredUser, Number(result.insertId))
         return json(response, 201, { user: registeredUser })
       } catch (error) {
-        if (error instanceof Error && error.message.includes('UNIQUE')) return json(response, 409, { error: '用户名或邮箱已被注册' })
+        if (error instanceof Error && (error.message.includes('UNIQUE') || error.message.includes('Duplicate'))) return json(response, 409, { error: '用户名或邮箱已被注册' })
         return json(response, 400, { error: '注册失败，请检查填写信息' })
       }
     }
     if (url.pathname === '/api/auth/login' && request.method === 'POST') {
+      if (!allowAuthRequest(request)) return json(response, 429, { error: '登录尝试过于频繁，请稍后再试' })
       try {
         const body = await readJson(request)
         const account = String(body.account ?? '').trim()
         const password = String(body.password ?? '')
-        const captchaId = String(body.captchaId ?? '')
-        const captcha = captchaChallenges.get(captchaId)
         if (body.acceptedTerms !== true) return json(response, 400, { error: '请先阅读并同意用户协议和隐私条款' })
-        if (!captcha?.verified || captcha.expiresAt < Date.now()) return json(response, 400, { error: '请先完成滑动拼图验证' })
-        captchaChallenges.delete(captchaId)
+        if (!await verifyTurnstile(request, body.turnstileToken, 'login')) return json(response, 400, { error: '人机验证失败或已过期，请重试' })
         const row = await database.prepare('SELECT id, username, password_hash, role FROM users WHERE username = ? OR email = ?').get(account, account) as Record<string, unknown> | undefined
         if (!row || !passwordMatches(password, String(row.password_hash))) return json(response, 401, { error: '账号或密码错误' })
         const signedInUser = localUser(row)
@@ -278,12 +338,38 @@ function authPlugin(clientId: string, clientSecret: string, googleClientId: stri
         return json(response, 400, { error: '登录请求无效' })
       }
     }
+    if (url.pathname === '/api/auth/reset-password' && request.method === 'POST') {
+      if (!allowAuthRequest(request)) return json(response, 429, { error: '请求过于频繁，请稍后再试' })
+      try {
+        const body = await readJson(request)
+        const email = String(body.email ?? '').trim().toLowerCase()
+        if (!verificationSecret) return json(response, 503, { error: '邮件验证码服务尚未配置' })
+        const code = String(body.code ?? '').trim()
+        const password = String(body.password ?? '')
+        if (!await verifyTurnstile(request, body.turnstileToken, 'reset_password')) return json(response, 400, { error: '人机验证失败或已过期，请重试' })
+        if (password.length < 8 || password.length > 128 || !/[A-Za-z]/.test(password) || !/\d/.test(password)) return json(response, 400, { error: '密码需为 8–128 位，并同时包含字母和数字' })
+        const verification = await database.prepare("SELECT id, code_hash, attempts FROM email_verification_codes WHERE email = ? AND purpose = 'reset-password' AND consumed_at IS NULL AND expires_at > CURRENT_TIMESTAMP ORDER BY id DESC LIMIT 1").get(email) as { id: number; code_hash: string; attempts: number } | undefined
+        const account = await database.prepare('SELECT id FROM users WHERE email = ?').get(email)
+        if (!account) return json(response, 400, { error: '邮箱验证码错误或已失效' })
+        if (!verification || verification.attempts >= 5 || verification.code_hash !== verificationCodeHash(email, 'reset-password', code, verificationSecret)) {
+          if (verification) await database.prepare('UPDATE email_verification_codes SET attempts = attempts + 1 WHERE id = ?').run(verification.id)
+          return json(response, 400, { error: '邮箱验证码错误或已失效' })
+        }
+        await database.transaction(async connection => {
+          await database.run('UPDATE users SET password_hash = ? WHERE email = ?', [passwordHash(password), email], connection)
+          await database.run('UPDATE email_verification_codes SET consumed_at = CURRENT_TIMESTAMP WHERE id = ?', [verification.id], connection)
+        })
+        return json(response, 200, { ok: true })
+      } catch {
+        return json(response, 400, { error: '密码重置失败，请检查填写信息' })
+      }
+    }
     if (url.pathname === '/api/auth/github' && request.method === 'GET') {
       if (!clientId || !clientSecret) return json(response, 503, { error: 'GitHub 登录尚未配置，请设置 GITHUB_CLIENT_ID 和 GITHUB_CLIENT_SECRET' })
       const state = randomBytes(24).toString('hex')
       oauthStates.set(state, Date.now() + 10 * 60 * 1000)
       response.statusCode = 302
-      response.setHeader('set-cookie', `omwai_oauth_state=${state}; Path=/; HttpOnly; SameSite=Lax; Max-Age=600`)
+      response.setHeader('set-cookie', `omwai_oauth_state=${state}; Path=/; HttpOnly; SameSite=Lax; Max-Age=600${cookieSecurity}`)
       response.setHeader('location', `https://github.com/login/oauth/authorize?client_id=${encodeURIComponent(clientId)}&scope=read%3Auser&state=${state}`)
       return response.end()
     }
@@ -319,7 +405,7 @@ function authPlugin(clientId: string, clientSecret: string, googleClientId: stri
       oauthStates.set(state, Date.now() + 10 * 60 * 1000)
       const redirectUri = `${url.protocol}//${request.headers.host}/api/auth/google/callback`
       response.statusCode = 302
-      response.setHeader('set-cookie', `omwai_oauth_state=${state}; Path=/; HttpOnly; SameSite=Lax; Max-Age=600`)
+      response.setHeader('set-cookie', `omwai_oauth_state=${state}; Path=/; HttpOnly; SameSite=Lax; Max-Age=600${cookieSecurity}`)
       response.setHeader('location', `https://accounts.google.com/o/oauth2/v2/auth?client_id=${encodeURIComponent(googleClientId)}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=openid%20profile%20email&state=${state}`)
       return response.end()
     }
@@ -451,5 +537,13 @@ function authPlugin(clientId: string, clientSecret: string, googleClientId: stri
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
-  return { plugins: [react(), groupProbePlugin(), authPlugin(env.GITHUB_CLIENT_ID, env.GITHUB_CLIENT_SECRET, env.GOOGLE_CLIENT_ID, env.GOOGLE_CLIENT_SECRET, env.DATABASE_URL, env.SITE_CREDENTIAL_ENCRYPTION_KEY ?? '')] }
+  const emailConfig = {
+    host: env.SMTP_HOST,
+    port: Number(env.SMTP_PORT || 587),
+    secure: env.SMTP_SECURE === 'true',
+    user: env.SMTP_USER,
+    password: env.SMTP_PASSWORD,
+    from: env.SMTP_FROM,
+  }
+  return { plugins: [react(), groupProbePlugin(), authPlugin(env.GITHUB_CLIENT_ID, env.GITHUB_CLIENT_SECRET, env.GOOGLE_CLIENT_ID, env.GOOGLE_CLIENT_SECRET, env.DATABASE_URL, env.SITE_CREDENTIAL_ENCRYPTION_KEY ?? '', emailConfig, env.EMAIL_VERIFICATION_SECRET, env.COOKIE_SECURE === 'true', env.TURNSTILE_SITE_KEY, env.TURNSTILE_SECRET_KEY)] }
 })

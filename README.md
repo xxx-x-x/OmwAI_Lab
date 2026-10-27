@@ -28,6 +28,12 @@
 
 定价表格的“模型ID”列显示 API 的 `modelId`（所保留型号的原始模型 ID），保留日期后缀及版本分隔符，不添加厂商前缀或用显示名称替代；搜索支持模型 ID、名称与厂商，方便后续与中转站 `/models` 接口返回的 ID 对照。现有基础型号合并规则不变，未保留的版本 ID 不单独展示。模型公司列同时显示厂商 Logo 和名称；移除价格来源列，来源链接统一保留在页面底部说明区域。新增的发布时间列读取 BaseLLM `release_date`，持久化到数据库同名列，并通过 API `releaseDate` 返回。显示所保留默认型号的发布日期，不使用价格核对日期或同步时间代替；缺失时显示“—”。
 
+## 账号与邮件配置
+
+本地账号支持邮箱验证码注册、用户名或邮箱登录，以及邮箱验证码重置密码。验证码 10 分钟有效，同一验证码最多尝试 5 次，发送及认证接口包含基础频率限制。SMTP 凭据只从环境变量读取；复制 `.env.example` 为 `.env` 后配置 `SMTP_HOST`、`SMTP_PORT`、`SMTP_SECURE`、`SMTP_USER`、`SMTP_PASSWORD`、`SMTP_FROM`，并为 `EMAIL_VERIFICATION_SECRET` 设置独立随机密钥。
+
+登录、注册、发送验证码和重置密码均使用 Cloudflare Turnstile，并在服务端验证一次性 Token 及对应 action；前端验证结果本身不作为可信依据。请在 Cloudflare Turnstile 控制台添加生产域名和本地开发域名，然后配置 `TURNSTILE_SITE_KEY` 与 `TURNSTILE_SECRET_KEY`。HTTPS 生产环境还应设置 `COOKIE_SECURE=true`。
+
 ## 收录字段
 
 - **服务商**：服务或品牌名称。

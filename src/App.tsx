@@ -6,6 +6,7 @@ import { AdminQuotes, SiteQuotesPage } from './SiteQuotes'
 import { modelFilters, type Provider, providers } from './data'
 import { ModelBrandIcon } from './ModelBrandIcon'
 import ModelLeaderboardPage from './ModelLeaderboard'
+import { Turnstile } from './Turnstile'
 import './App.css'
 
 function Logo() {
@@ -40,48 +41,53 @@ function GoogleMark() {
 
 function LoginPage({ user }: { user: AuthUser | null }) {
   const [registering, setRegistering] = useState(false)
+  const [resetting, setResetting] = useState(false)
   const [showPassword, setShowPassword] = useState(false)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
   const [acceptedTerms, setAcceptedTerms] = useState(false)
-  const [captcha, setCaptcha] = useState<{ id: string; target: number } | null>(null)
-  const [position, setPosition] = useState(0)
-  const [verified, setVerified] = useState(false)
-  const resetCaptcha = () => { setCaptcha(null); setVerified(false); setPosition(0) }
-  const startCaptcha = async () => {
-    setBusy(true); setError(''); resetCaptcha()
+  const [turnstileSiteKey, setTurnstileSiteKey] = useState('')
+  const [turnstileToken, setTurnstileToken] = useState('')
+  const [turnstileResetKey, setTurnstileResetKey] = useState(0)
+  const [email, setEmail] = useState('')
+  const [message, setMessage] = useState('')
+  const [cooldown, setCooldown] = useState(0)
+  useEffect(() => { if (!cooldown) return; const timer = window.setTimeout(() => setCooldown(cooldown - 1), 1000); return () => window.clearTimeout(timer) }, [cooldown])
+  useEffect(() => { fetch('/api/auth/turnstile-config').then(async response => { const result = await response.json(); if (!response.ok) throw new Error(result.error); setTurnstileSiteKey(result.siteKey) }).catch(() => setError('人机验证加载失败，请稍后刷新页面')) }, [])
+  const resetTurnstile = () => { setTurnstileToken(''); setTurnstileResetKey(value => value + 1) }
+  const turnstileAction = resetting ? 'reset_password' : registering ? 'register' : 'login'
+  const handleTurnstileToken = useCallback((token: string) => setTurnstileToken(token), [])
+  const handleTurnstileError = useCallback(() => setError('人机验证加载失败，请稍后重试'), [])
+  const sendCode = async () => {
+    setError(''); setMessage('')
+    if (!email) { setError('请先填写邮箱地址'); return }
+    if (!turnstileToken) { setError('请先完成人机验证'); return }
+    setBusy(true)
     try {
-      const response = await fetch('/api/auth/captcha', { method: 'POST' })
-      const result = await response.json()
-      if (!response.ok || typeof result.id !== 'string' || !Number.isFinite(result.target) || result.target < 0 || result.target > 100) throw new Error(result.error || '获取验证失败，请重试')
-      setCaptcha({ id: result.id, target: result.target })
-    } catch { setError('获取验证失败，请检查网络后重试') } finally { setBusy(false) }
-  }
-  const verifyCaptcha = async () => {
-    if (!captcha) return
-    setBusy(true); setError('')
-    try {
-      const response = await fetch('/api/auth/captcha/verify', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: captcha.id, position }) })
-      const result = await response.json()
-      if (!response.ok || result.ok !== true) { resetCaptcha(); setError(result.error || '验证失败，请重试'); return }
-      setVerified(true)
-    } catch { resetCaptcha(); setError('验证请求失败，请重新获取验证') } finally { setBusy(false) }
+      const response = await fetch('/api/auth/email-code', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email, purpose: resetting ? 'reset-password' : 'register', turnstileToken }) })
+      const result = await response.json().catch(() => ({}))
+      if (!response.ok) { setError(result.error ?? '验证码发送失败'); return }
+      setCooldown(Number(result.cooldown) || 60); setMessage('验证码已发送，请检查邮箱和垃圾邮件文件夹，请再次完成人机验证后提交')
+    } catch { setError('验证码发送失败，请检查网络后重试') } finally { setBusy(false); resetTurnstile() }
   }
   if (user) return <Navigate to="/submit" replace />
   const submitAuth = async (event: React.FormEvent<HTMLFormElement>) => {
-    event.preventDefault(); setError('')
-    if (!registering && (!acceptedTerms || !verified || !captcha)) { setError('请同意条款并完成滑动验证'); return }
+    event.preventDefault(); setError(''); setMessage('')
+    if (!registering && !resetting && !acceptedTerms) { setError('请先同意用户协议和隐私条款'); return }
+    if (!turnstileToken) { setError('请先完成人机验证'); return }
     setBusy(true)
-    const body = { ...Object.fromEntries(new FormData(event.currentTarget)), ...(!registering ? { acceptedTerms, captchaId: captcha?.id } : {}) }
+    const body = { ...Object.fromEntries(new FormData(event.currentTarget)), turnstileToken, ...(!registering && !resetting ? { acceptedTerms } : {}) }
     try {
-      const response = await fetch(`/api/auth/${registering ? 'register' : 'login'}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+      const response = await fetch(`/api/auth/${resetting ? 'reset-password' : registering ? 'register' : 'login'}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
       const result = await response.json().catch(() => ({}))
-      if (!response.ok) { if (!registering) resetCaptcha(); setError(result.error ?? '操作失败，请稍后重试'); return }
+      if (!response.ok) { resetTurnstile(); setError(result.error ?? '操作失败，请稍后重试'); return }
+      if (resetting) { setResetting(false); setMessage('密码已重置，请使用新密码登录'); return }
       const next = new URLSearchParams(window.location.search).get('next')
       window.location.href = next && next.startsWith('/') && !next.startsWith('//') && !next.includes('\\') ? next : '/submit'
-    } catch { if (!registering) resetCaptcha(); setError('请求失败，请检查网络后重试') } finally { setBusy(false) }
+    } catch { resetTurnstile(); setError('请求失败，请检查网络后重试') } finally { setBusy(false) }
   }
-  return <section className="auth-page"><div className="auth-backdrop" /><div className="auth-card"><div className="auth-brand"><img src="https://download.xx-xzh.xyz/omwai_logo.png" alt="" /><h1>{registering ? '注册' : '登录'} <strong>OmwAI_Lab</strong></h1></div><form onSubmit={submitAuth}>{registering && <label>用户名<input name="username" required autoComplete="username" placeholder="请输入用户名" minLength={2} maxLength={24} /></label>}<label>{registering ? '邮箱' : '用户名或邮箱'}<input name={registering ? 'email' : 'account'} required type={registering ? 'email' : 'text'} autoComplete={registering ? 'email' : 'username'} placeholder={registering ? '请输入邮箱地址' : '请输入用户名或邮箱地址'} /></label><label>密码<div className="password-field"><input name="password" required type={showPassword ? 'text' : 'password'} autoComplete={registering ? 'new-password' : 'current-password'} placeholder={registering ? '至少 8 位密码' : '请输入登录密码'} minLength={8} /><button type="button" onClick={() => setShowPassword(value => !value)} aria-label={showPassword ? '隐藏密码' : '显示密码'}>{showPassword ? <EyeOff size={16} /> : <Eye size={16} />}</button></div></label>{!registering && <button className="forgot-link" type="button" disabled title="邮件服务接入后开放">忘记密码？</button>}{!registering && <><label className="auth-terms"><input type="checkbox" checked={acceptedTerms} onChange={event => setAcceptedTerms(event.target.checked)} required />我同意用户协议和隐私条款（当前站点未提供条款链接）</label><div className="auth-captcha"><span>滑动验证：{verified ? '验证通过' : captcha ? `将滑块移至 ${captcha.target} 附近` : '请先获取验证'}</span>{captcha && !verified && <><input type="range" min="0" max="100" value={position} onChange={event => setPosition(Number(event.target.value))} aria-label="滑动验证位置" /><span>当前位置：{position}</span><button type="button" disabled={busy} onClick={verifyCaptcha}>验证</button></>}<button type="button" disabled={busy} onClick={startCaptcha}>{captcha ? '重新获取验证' : '获取验证'}</button></div></>}{error && <p className="auth-error" role="alert">{error}</p>}<button className="auth-submit" type="submit" disabled={busy}>{busy ? '请稍候…' : <>{registering ? '注册' : '登录'} <ArrowRight size={15} /></>}</button></form><div className="auth-switch">{registering ? '已有账号？' : '还没有账号？'} <button type="button" disabled={busy} onClick={() => { setRegistering(value => !value); setError(''); resetCaptcha(); setAcceptedTerms(false) }}>{registering ? '立即登录' : '立即注册'}</button></div><div className="auth-divider"><span>或使用以下方式</span></div><div className="social-login"><a href="/api/auth/github" aria-label="使用 GitHub 登录" title="使用 GitHub 登录"><GitHubMark /></a><a href="/api/auth/google" aria-label="使用 Google 登录" title="使用 Google 登录"><GoogleMark /></a></div></div></section>
+  const title = resetting ? '重置密码' : registering ? '注册' : '登录'
+  return <section className="auth-page"><div className="auth-backdrop" /><div className="auth-card"><div className="auth-brand"><img src="https://download.xx-xzh.xyz/omwai_logo.png" alt="" /><h1>{title} <strong>OmwAI_Lab</strong></h1></div><form onSubmit={submitAuth}>{registering && <label>用户名<input name="username" required autoComplete="username" placeholder="请输入用户名" minLength={2} maxLength={24} /></label>}<label>{registering || resetting ? '邮箱' : '用户名或邮箱'}<input name={registering || resetting ? 'email' : 'account'} required type={registering || resetting ? 'email' : 'text'} autoComplete={registering || resetting ? 'email' : 'username'} value={registering || resetting ? email : undefined} onChange={registering || resetting ? event => setEmail(event.target.value) : undefined} placeholder={registering || resetting ? '请输入邮箱地址' : '请输入用户名或邮箱地址'} /></label><label>{resetting ? '新密码' : '密码'}<div className="password-field"><input name="password" required type={showPassword ? 'text' : 'password'} autoComplete={registering || resetting ? 'new-password' : 'current-password'} placeholder={registering || resetting ? '至少 8 位，包含字母和数字' : '请输入登录密码'} minLength={8} /><button type="button" onClick={() => setShowPassword(value => !value)} aria-label={showPassword ? '隐藏密码' : '显示密码'}>{showPassword ? <EyeOff size={16} /> : <Eye size={16} />}</button></div></label>{(registering || resetting) && <label>邮箱验证码<div className="code-field"><input name="code" required inputMode="numeric" pattern="[0-9]{6}" maxLength={6} placeholder="6 位验证码" /><button type="button" disabled={busy || cooldown > 0} onClick={sendCode}>{cooldown ? `${cooldown}s` : '发送验证码'}</button></div></label>}{!registering && !resetting && <button className="forgot-link" type="button" onClick={() => { setResetting(true); setError(''); setMessage(''); resetTurnstile() }}>忘记密码？</button>}{!registering && !resetting && <><label className="auth-terms"><input type="checkbox" checked={acceptedTerms} onChange={event => setAcceptedTerms(event.target.checked)} required />我同意用户协议和隐私条款（当前站点未提供条款链接）</label></>}{turnstileSiteKey && <Turnstile siteKey={turnstileSiteKey} action={turnstileAction} resetKey={turnstileResetKey} onToken={handleTurnstileToken} onError={handleTurnstileError} />}{message && <p className="auth-message" role="status">{message}</p>}{error && <p className="auth-error" role="alert">{error}</p>}<button className="auth-submit" type="submit" disabled={busy}>{busy ? '请稍候…' : <>{title} <ArrowRight size={15} /></>}</button></form><div className="auth-switch">{registering || resetting ? '已有账号？' : '还没有账号？'} <button type="button" disabled={busy} onClick={() => { setRegistering(!registering && !resetting); setResetting(false); setError(''); setMessage(''); resetTurnstile(); setAcceptedTerms(false) }}>{registering || resetting ? '立即登录' : '立即注册'}</button></div>{!registering && !resetting && <><div className="auth-divider"><span>或使用以下方式</span></div><div className="social-login"><a href="/api/auth/github" aria-label="使用 GitHub 登录" title="使用 GitHub 登录"><GitHubMark /></a><a href="/api/auth/google" aria-label="使用 Google 登录" title="使用 Google 登录"><GoogleMark /></a></div></>}</div></section>
 }
 
 /* oxlint-disable-next-line no-unused-vars -- retained as the planned marketing landing page */

@@ -48,7 +48,8 @@ export type Database = ReturnType<typeof createDatabase>
 
 export async function initializeDatabase(database: Database) {
   const statements = [
-    `CREATE TABLE IF NOT EXISTS users (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, username VARCHAR(191) NOT NULL UNIQUE, email VARCHAR(191) NOT NULL UNIQUE, password_hash TEXT NOT NULL, role VARCHAR(20) NOT NULL DEFAULT 'user', created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS users (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, username VARCHAR(191) NOT NULL UNIQUE, email VARCHAR(191) NOT NULL UNIQUE, password_hash TEXT NOT NULL, role VARCHAR(20) NOT NULL DEFAULT 'user', email_verified_at TIMESTAMP NULL DEFAULT NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS email_verification_codes (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, email VARCHAR(191) NOT NULL, purpose VARCHAR(32) NOT NULL, code_hash CHAR(64) NOT NULL, expires_at TIMESTAMP NOT NULL, consumed_at TIMESTAMP NULL DEFAULT NULL, attempts TINYINT UNSIGNED NOT NULL DEFAULT 0, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, INDEX idx_email_codes_lookup (email, purpose, created_at)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
     `CREATE TABLE IF NOT EXISTS submissions (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, user_id BIGINT UNSIGNED NULL, submitter_login VARCHAR(191) NOT NULL, name VARCHAR(255) NOT NULL, website VARCHAR(2048) NOT NULL, models TEXT NOT NULL, pricing TEXT NOT NULL, notes TEXT NOT NULL, status VARCHAR(20) NOT NULL DEFAULT 'pending', review_note TEXT NOT NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, CONSTRAINT fk_submissions_user FOREIGN KEY(user_id) REFERENCES users(id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
     `CREATE TABLE IF NOT EXISTS managed_providers (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, submission_id BIGINT UNSIGNED NULL UNIQUE, name VARCHAR(255) NOT NULL, website VARCHAR(2048) NOT NULL, models TEXT NOT NULL, pricing TEXT NOT NULL, notes TEXT NOT NULL, active TINYINT(1) NOT NULL DEFAULT 1, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE KEY uq_managed_providers_website (website(191))) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
     `CREATE TABLE IF NOT EXISTS audit_logs (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, admin_id BIGINT UNSIGNED NOT NULL, action VARCHAR(100) NOT NULL, target_type VARCHAR(100) NOT NULL, target_id BIGINT NULL, details TEXT NOT NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, INDEX idx_audit_logs_admin_id (admin_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
@@ -60,6 +61,10 @@ export async function initializeDatabase(database: Database) {
     `CREATE TABLE IF NOT EXISTS model_price_syncs (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, source_url VARCHAR(2048) NOT NULL, model_count INT NOT NULL, provider_count INT NOT NULL, synced_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
   ]
   for (const statement of statements) await database.run(statement)
+  const userColumns = await database.all<{ Field: string } & DatabaseRow>('SHOW COLUMNS FROM users')
+  if (!userColumns.some(column => column.Field === 'email_verified_at')) {
+    await database.run('ALTER TABLE users ADD COLUMN email_verified_at TIMESTAMP NULL DEFAULT NULL AFTER role')
+  }
   const submissionColumns = await database.all<{ Field: string } & DatabaseRow>('SHOW COLUMNS FROM submissions')
   if (!submissionColumns.some(column => column.Field === 'local_owner_verified')) {
     await database.run('ALTER TABLE submissions ADD COLUMN local_owner_verified TINYINT(1) NOT NULL DEFAULT 0')
