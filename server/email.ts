@@ -30,5 +30,5 @@ export function createEmailService(config: EmailConfig) {
     })
   }
 
-  return { configured, sendVerificationCode }
+  return { configured, sendVerificationCode, close: () => transporter?.close() }
 }

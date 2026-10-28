@@ -5,18 +5,21 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "tsc -b && vite build && tsc -p tsconfig.server.json",
     "lint": "oxlint",
     "preview": "vite preview",
     "db:migrate": "node --env-file=.env --experimental-strip-types scripts/migrate-sqlite-to-mysql.ts",
     "db:sync-rankings": "node --env-file=.env --experimental-strip-types scripts/sync-model-rankings.ts",
-    "db:sync-prices": "node --env-file=.env --experimental-strip-types scripts/sync-model-prices.ts"
+    "db:sync-prices": "node --env-file=.env --experimental-strip-types scripts/sync-model-prices.ts",
+    "start": "node --env-file-if-exists=.env dist-server/production.js",
+    "test:server": "tsc -p tsconfig.server.json && node --test server/production.test.mjs"
   },
   "dependencies": {
     "@lobehub/icons": "^6.13.0",
     "lucide-react": "^1.61.0",
     "mysql2": "^3.24.6",
     "nodemailer": "^10.2.1",
+    "ioredis": "^5.8.2",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
     "react-router-dom": "^7.18.4"
@@ -30,5 +33,8 @@
     "oxlint": "^1.88.0",
     "typescript": "~6.0.3",
     "vite": "^8.3.4"
+  },
+  "engines": {
+    "node": ">=22.12.0"
   }
 }

@@ -2,6 +2,7 @@ import { createCipheriv, randomBytes } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { TLSSocket } from 'node:tls'
 import type { Database } from './mysql.js'
+import { publicComparisonQuotes } from './public-pricing.ts'
 
 export function encryptCredential(secret: string, configuredKey: string) {
   if (!/^[0-9a-fA-F]{64}$/.test(configuredKey)) throw new Error('Credential encryption is not configured')
@@ -43,8 +44,9 @@ export async function handleSiteGroups(c: Context) {
   if (url.pathname === '/api/site-comparison' && req.method === 'GET') {
     const model = url.searchParams.get('modelId')
     if (!model || model.length > 191) return send(400, { error: 'modelId is required' })
+    const publicQuotes = await publicComparisonQuotes(db, model)
     const quotes = await db.prepare(`SELECT q.id, q.model_id AS modelId, a.group_name AS groupName, q.currency, q.billing_unit AS billingUnit, q.input_price AS inputPrice, q.output_price AS outputPrice, q.source_url AS sourceUrl, q.reviewed_at AS reviewedAt, 'manual' AS sourceType, 'approved' AS sourceStatus, s.id AS siteId, s.name AS siteName, s.website FROM group_authorization_quotes q JOIN group_authorizations a ON a.id = q.authorization_id JOIN submissions s ON s.id = a.submission_id AND a.user_id = s.user_id WHERE BINARY q.model_id = BINARY ? AND q.status = 'approved' AND s.status = 'approved' AND s.local_owner_verified = 1 AND a.revoked_at IS NULL AND a.credential IS NOT NULL ORDER BY q.id DESC LIMIT 500`).all(model)
-    return send(200, { quotes })
+    return send(200, { quotes: [...publicQuotes, ...quotes] })
   }
   if (!localUserId) return send(401, { error: 'Local login required' })
   if (req.method !== 'GET') {
