@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react'
+import { useTheme } from './useTheme'
 
 declare global {
   interface Window {
@@ -27,17 +28,19 @@ function loadTurnstile() {
 }
 
 export function Turnstile({ siteKey, action, resetKey, onToken, onError }: { siteKey: string; action: string; resetKey: number; onToken: (token: string) => void; onError: () => void }) {
+  const { theme } = useTheme()
   const containerRef = useRef<HTMLDivElement>(null)
   const widgetRef = useRef<string | null>(null)
 
   useEffect(() => {
     let disposed = false
+    onToken('')
     loadTurnstile().then(() => {
       if (disposed || !containerRef.current || !window.turnstile) return
       widgetRef.current = window.turnstile.render(containerRef.current, {
         sitekey: siteKey,
         action,
-        theme: 'light',
+        theme,
         size: 'flexible',
         callback: (token: string) => onToken(token),
         'expired-callback': () => onToken(''),
@@ -49,7 +52,7 @@ export function Turnstile({ siteKey, action, resetKey, onToken, onError }: { sit
       if (widgetRef.current && window.turnstile) window.turnstile.remove(widgetRef.current)
       widgetRef.current = null
     }
-  }, [action, onError, onToken, siteKey])
+  }, [action, onError, onToken, siteKey, theme])
 
   useEffect(() => {
     if (resetKey > 0 && widgetRef.current && window.turnstile) {

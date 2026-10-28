@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Activity, ArrowDown, ArrowLeft, ArrowRight, ArrowUp, BadgeCheck, Check, CheckCircle2, ChevronRight, CircleDollarSign, Clock3, Coins, Eye, EyeOff, ExternalLink, FileCheck2, GitBranch, Globe2, LayoutDashboard, LayoutGrid, List, LogOut, Menu, RefreshCw, Search, ServerCog, ShieldCheck, Sparkles, Trophy, Users, X, Zap } from 'lucide-react'
+import { Activity, ArrowDown, ArrowLeft, ArrowRight, ArrowUp, BadgeCheck, Check, CheckCircle2, ChevronRight, CircleDollarSign, Clock3, Coins, Eye, EyeOff, ExternalLink, FileCheck2, GitBranch, Globe2, LayoutDashboard, LayoutGrid, List, LogOut, Menu, Moon, Sun, RefreshCw, Search, ServerCog, ShieldCheck, Sparkles, Trophy, Users, X, Zap } from 'lucide-react'
 import { Link, NavLink, Navigate, Route, Routes, useLocation, useParams, useSearchParams } from 'react-router-dom'
 import ModelPriceDetail from './ModelPriceDetail'
 import { AdminQuotes } from './SiteQuotes'
@@ -11,6 +11,7 @@ import SiteManagement from './SiteManagement'
 import SiteLogoSettings from './SiteLogoSettings'
 import { useDirectoryProviders } from './directoryProviders'
 import { pricingFamilies, pricingFamilyLabel } from './pricingFamilies'
+import { useTheme } from './useTheme'
 import './App.css'
 
 function Logo() {
@@ -22,13 +23,14 @@ type AdminSection = 'overview' | 'submissions' | 'providers' | 'users' | 'logs' 
 type AdminRow = Record<string, string | number | null>
 
 function Layout() {
+  const { theme, toggleTheme } = useTheme()
   const [menuOpen, setMenuOpen] = useState(false)
   const [user, setUser] = useState<AuthUser | null>(null)
   const [authLoading, setAuthLoading] = useState(true)
   useEffect(() => { fetch('/api/auth/me').then(response => response.json()).then(data => setUser(data.user ?? null)).finally(() => setAuthLoading(false)) }, [])
   const logout = async () => { await fetch('/api/auth/logout', { method: 'POST' }); setUser(null) }
   return <div className="app-shell">
-    <header className="site-header"><div className="container nav-wrap"><Logo /><button className="menu-button" onClick={() => setMenuOpen(!menuOpen)} aria-label="打开导航">{menuOpen ? <X size={22} /> : <Menu size={22} />}</button><nav className={menuOpen ? 'nav open' : 'nav'} onClick={() => setMenuOpen(false)}><NavLink to="/">服务目录</NavLink><NavLink to="/models">模型排行榜</NavLink><NavLink to="/pricing">定价</NavLink><NavLink to="/submit">提交收录</NavLink>{user?.role === 'admin' && <NavLink to="/admin">管理后台</NavLink>}<a href="https://github.com/xxx-x-x/OmwAI_Lab" target="_blank" rel="noreferrer">关于项目</a></nav>{user ? <div className="user-menu"><details className="avatar-dropdown"><summary aria-label="打开账户菜单"><img src={user.avatar_url} alt="" /><span>{user.name || user.login}</span></summary><div className="avatar-dropdown-panel" onClick={event => event.currentTarget.closest('details')?.removeAttribute('open')}><Link to="/site-management">站点管理</Link></div></details><button type="button" onClick={logout} aria-label="退出登录" title="退出登录"><LogOut size={16} /></button></div> : <Link className="button button-small nav-cta" to="/login"><GitBranch size={16} /> 登录</Link>}</div></header>
+    <header className="site-header"><div className="container nav-wrap"><Logo /><button className="menu-button" onClick={() => setMenuOpen(!menuOpen)} aria-label="打开导航">{menuOpen ? <X size={22} /> : <Menu size={22} />}</button><nav className={menuOpen ? 'nav open' : 'nav'} onClick={() => setMenuOpen(false)}><NavLink to="/">服务目录</NavLink><NavLink to="/models">模型排行榜</NavLink><NavLink to="/pricing">定价</NavLink><NavLink to="/submit">提交收录</NavLink>{user?.role === 'admin' && <NavLink to="/admin">管理后台</NavLink>}<a href="https://github.com/xxx-x-x/OmwAI_Lab" target="_blank" rel="noreferrer">关于项目</a></nav><button type="button" className="theme-toggle" onClick={toggleTheme} aria-label={theme === 'light' ? '切换到深色模式' : '切换到浅色模式'} title={theme === 'light' ? '切换到深色模式' : '切换到浅色模式'}>{theme === 'light' ? <Moon size={19} /> : <Sun size={19} />}</button>{user ? <div className="user-menu"><details className="avatar-dropdown"><summary aria-label="打开账户菜单"><img src={user.avatar_url} alt="" /><span>{user.name || user.login}</span></summary><div className="avatar-dropdown-panel" onClick={event => event.currentTarget.closest('details')?.removeAttribute('open')}><Link to="/site-management">站点管理</Link></div></details><button type="button" onClick={logout} aria-label="退出登录" title="退出登录"><LogOut size={16} /></button></div> : <Link className="button button-small nav-cta" to="/login"><GitBranch size={16} /> 登录</Link>}</div></header>
     <main><Routes><Route path="/" element={<DirectoryPage />} /><Route path="/directory" element={<DirectoryPage />} /><Route path="/models" element={<ModelLeaderboardPage />} /><Route path="/pricing" element={<PricingPage />} /><Route path="/pricing/model" element={<ModelPriceDetail />} /><Route path="/welcome" element={<HomePage />} /><Route path="/provider/:id" element={<DetailPage />} /><Route path="/login" element={<LoginPage user={user} />} /><Route path="/submit" element={authLoading ? <AuthLoading /> : user ? <Navigate to="/site-management" replace /> : <Navigate to="/login?next=/submit" replace />} /><Route path="/site-management/*" element={authLoading ? <AuthLoading /> : user ? <SiteManagement /> : <Navigate to="/login?next=/site-management" replace />} /><Route path="/site-quotes" element={<Navigate to="/site-management/sites" replace />} /><Route path="/admin" element={authLoading ? <AuthLoading /> : user?.role === 'admin' ? <AdminPage /> : <Navigate to={user ? '/' : '/login'} replace />} /><Route path="*" element={<NotFound />} /></Routes></main><Footer />
   </div>
 }

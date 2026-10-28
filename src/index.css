@@ -2,8 +2,9 @@
 
 :root {
   font-family: 'Noto Sans SC', sans-serif;
-  color: #172033;
-  background: #f8faff;
+  color-scheme: light;
+  color: var(--ink);
+  background: var(--page-bg);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   --primary: #625bf6;
@@ -24,6 +25,42 @@
   --shadow-raised: 0 14px 35px rgba(35, 47, 77, 0.09);
   --shadow-primary: 0 10px 24px rgba(98, 91, 246, 0.2);
   --shadow-dialog: 0 25px 80px rgba(20, 25, 50, 0.28);
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --primary: #a49dff;
+  --primary-dark: #8e85f5;
+  --primary-soft: #292641;
+  --primary-border: #504a7b;
+  --ink: #e5e9f3;
+  --heading: #f0f2fa;
+  --text-secondary: #b5bfd1;
+  --muted: #9ca8bd;
+  --text-light: #8c99af;
+  --line: #303a4e;
+  --line-soft: #263044;
+  --surface: #1a2232;
+  --page-bg: #101623;
+  --surface-muted: #202a3c;
+  --shadow-card: 0 8px 28px rgba(0, 0, 0, .18);
+  --shadow-raised: 0 14px 35px rgba(0, 0, 0, .24);
+  --shadow-dialog: 0 25px 80px rgba(0, 0, 0, .5);
+  --theme-surface: var(--surface);
+  --theme-surface-muted: var(--surface-muted);
+  --theme-ink: var(--ink);
+  --theme-text-secondary: var(--text-secondary);
+  --theme-muted: var(--muted);
+  --theme-line: var(--line);
+  --theme-accent: var(--primary);
+  --theme-accent-soft: var(--primary-soft);
+  --theme-accent-border: var(--primary-border);
+  --theme-success: #6bd3ab;
+  --theme-success-soft: #173a32;
+  --theme-warning: #edc075;
+  --theme-warning-soft: #3d3220;
+  --theme-danger: #f08d9b;
+  --theme-danger-soft: #3e2631;
+  --theme-glass: rgba(26, 34, 50, .92);
 }
 * { box-sizing: border-box; }
 html { scroll-behavior: smooth; }
