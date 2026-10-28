@@ -17,6 +17,7 @@ export type Provider = {
   responseTime: number | null
   availability: string
   invoice: boolean | null
+  billingDetails?: string
   billing: string
   highlights: string[]
 }

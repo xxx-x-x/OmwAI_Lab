@@ -1,10 +1,17 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Database } from './mysql.js'
 import { handleLogoSettings } from './site-logo-settings.ts'
+import { handleSiteRevision, ownerRevisions, revisionView } from './site-revisions.ts'
 
 export type SiteOwner = { id: string | number; login: string; html_url: string }
 export function ownerIdentity(user: SiteOwner, localUserId: number | null) {
   return localUserId !== null ? `local:${localUserId}` : `${user.html_url ? 'github' : 'google'}:${user.id}`
+}
+
+export function validateBilling(body: Record<string, unknown>) {
+  if (typeof body.billingType !== 'string' || !['按量计费', '按次计费', '包月订阅', '混合计费', '其他'].includes(body.billingType)) throw new Error('请选择计费方式')
+  if (body.billingDetails !== undefined && (typeof body.billingDetails !== 'string' || body.billingDetails.length > 1000)) throw new Error('计费补充说明格式无效')
+  return { billingType: body.billingType, billingDetails: typeof body.billingDetails === 'string' ? body.billingDetails.trim() : '' }
 }
 
 export function validateSubmission(body: Record<string, unknown>, now = new Date()) {
@@ -24,13 +31,14 @@ export function validateSubmission(body: Record<string, unknown>, now = new Date
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw new Error('站点地址无效')
   const date = new Date(`${foundedAt}T00:00:00.000Z`)
   if (!/^\d{4}-\d{2}-\d{2}$/.test(foundedAt) || !Number.isFinite(date.getTime()) || date.toISOString().slice(0, 10) !== foundedAt || foundedAt < '1000-01-01' || foundedAt > now.toISOString().slice(0, 10)) throw new Error('成立日期无效')
-  return { name, website, foundedAt, description, models, pricing, notes }
+  if (typeof body.invoice !== 'boolean') throw new Error('请选择是否支持发票')
+  return { name, website, foundedAt, description, models, pricing, notes, invoice: body.invoice, ...validateBilling(body) }
 }
 
 const fields = `s.id, s.user_id, s.submitter_login, s.name, s.website, s.models, s.pricing, s.notes, s.status, s.review_note, s.created_at, s.updated_at,
-  DATE_FORMAT(s.founded_at, '%Y-%m-%d') AS foundedAt, s.description, s.probe_notes AS probeNotes, s.probe_credential IS NOT NULL AS hasCredential, s.directory_listed AS directoryListed`
+  DATE_FORMAT(s.founded_at, '%Y-%m-%d') AS foundedAt, s.description, s.invoice_supported AS invoice, s.billing_type AS billingType, s.billing_details AS billingDetails, s.probe_notes AS probeNotes, s.probe_credential IS NOT NULL AS hasCredential, s.directory_listed AS directoryListed`
 const ownership = '(BINARY s.owner_identity = BINARY ? OR (? IS NOT NULL AND s.user_id = ?))'
-const flags = (row: Record<string, unknown>): Record<string, unknown> => ({ ...row, hasCredential: Boolean(row.hasCredential), directoryListed: Boolean(row.directoryListed) })
+const flags = (row: Record<string, unknown>): Record<string, unknown> => ({ ...row, invoice: row.invoice == null ? null : Boolean(row.invoice), hasCredential: Boolean(row.hasCredential), directoryListed: Boolean(row.directoryListed) })
 type Context = { database: Database; request: IncomingMessage; response: ServerResponse; url: URL; user: SiteOwner | null; localUserId: number | null; key: string; adminId?: number; onApproved?: () => void; readJson: (req: IncomingMessage) => Promise<Record<string, unknown>>; json: (res: ServerResponse, status: number, payload: unknown) => void }
 
 export async function handleSiteManagement(c: Context) {
@@ -39,21 +47,28 @@ export async function handleSiteManagement(c: Context) {
   res.setHeader('cache-control', 'no-store')
   try {
     if (url.pathname === '/api/directory' && req.method === 'GET') {
-      const sites = await db.prepare(`SELECT CONCAT('managed-', p.id) AS id, p.name, p.website, p.models, p.pricing, CASE WHEN l.image IS NOT NULL AND l.website = p.website THEN CONCAT('/api/site-logos/', p.id, '?v=', l.digest) ELSE NULL END AS logoUrl, s.description, DATE_FORMAT(s.founded_at, '%Y-%m-%d') AS foundedAt, s.updated_at AS updatedAt FROM managed_providers p JOIN submissions s ON s.id = p.submission_id LEFT JOIN site_logos l ON l.provider_id = p.id WHERE p.active = 1 AND s.status = 'approved' AND s.directory_listed = 1 ORDER BY p.id DESC`).all()
-      return send(200, { sites })
+      const sites = await db.prepare(`SELECT CONCAT('managed-', p.id) AS id, p.name, p.website, p.models, p.pricing, CASE WHEN l.image IS NOT NULL AND l.website = p.website THEN CONCAT('/api/site-logos/', p.id, '?v=', l.digest) ELSE NULL END AS logoUrl, s.description, s.invoice_supported AS invoice, s.billing_type AS billingType, s.billing_details AS billingDetails, DATE_FORMAT(s.founded_at, '%Y-%m-%d') AS foundedAt, s.updated_at AS updatedAt FROM managed_providers p JOIN submissions s ON s.id = p.submission_id LEFT JOIN site_logos l ON l.provider_id = p.id WHERE p.active = 1 AND s.status = 'approved' AND s.directory_listed = 1 ORDER BY p.id DESC`).all()
+      return send(200, { sites: sites.map(site => ({ ...site, invoice: site.invoice == null ? null : Boolean(site.invoice) })) })
     }
     if (!user) return send(401, { error: '请先登录' })
     const identity = ownerIdentity(user, localUserId)
+    if (/^\/api\/user\/sites\/\d+\/revision$/.test(url.pathname) || /^\/api\/admin\/site-revisions(?:\/\d+)?$/.test(url.pathname)) return await handleSiteRevision({ ...c, identity })
+    if (/^\/api\/user\/sites\/\d+\/(invoice|billing|logo(?:\/(?:preview|refetch|image))?)$/.test(url.pathname) && req.method !== 'GET') return send(409, { error: '公开信息修改必须提交审核，请使用站点修改申请接口', code: 'SITE_REVISION_REQUIRED' })
     if (url.pathname === '/api/submissions' && req.method === 'POST') {
       let submission: ReturnType<typeof validateSubmission>
       try { submission = validateSubmission(await c.readJson(req)) } catch { return send(400, { error: '提交信息格式无效，请检查必填信息、地址和日期' }) }
       const s = submission
-      const result = await db.prepare(`INSERT INTO submissions (user_id, local_owner_verified, owner_identity, submitter_login, name, website, founded_at, description, models, pricing, notes, review_note) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '')`).run(localUserId, localUserId !== null ? 1 : 0, identity, user.login, s.name, s.website, s.foundedAt, s.description, s.models, s.pricing, s.notes)
+      const result = await db.prepare(`INSERT INTO submissions (user_id, local_owner_verified, owner_identity, submitter_login, name, website, founded_at, description, models, pricing, notes, invoice_supported, billing_type, billing_details, review_note) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '')`).run(localUserId, localUserId !== null ? 1 : 0, identity, user.login, s.name, s.website, s.foundedAt, s.description, s.models, s.pricing, s.notes, s.invoice, s.billingType, s.billingDetails)
       return send(201, { ok: true, id: Number(result.insertId) })
     }
     if (url.pathname === '/api/user/sites' && req.method === 'GET') {
       const rows = await db.prepare(`SELECT ${fields}, p.active FROM submissions s LEFT JOIN managed_providers p ON p.submission_id = s.id WHERE ${ownership} ORDER BY s.created_at DESC`).all(identity, localUserId, localUserId)
-      const sites = rows.map(flags)
+      const revisions = await ownerRevisions(db, identity, localUserId)
+      const sites = rows.map((row): Record<string, unknown> => {
+        const history = revisions.filter(r => Number(r.submission_id) === Number(row.id))
+        const pending = history.find(r => r.status === 'pending')
+        return { ...flags(row), pendingRevision: pending ? revisionView(pending) : null, latestRevision: history[0] ? revisionView(history[0]) : null }
+      })
       return send(200, { sites, stats: { total: sites.length, pending: sites.filter(s => s.status === 'pending').length, approved: sites.filter(s => s.status === 'approved').length } })
     }
     const logoRoute = url.pathname.match(/^\/api\/(user\/sites|admin\/providers)\/(\d+)\/logo(?:\/(preview|refetch|image))?$/)

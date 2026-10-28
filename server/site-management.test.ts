@@ -6,7 +6,7 @@ import { initializeDatabase } from './mysql.ts'
 import { handleSiteManagement, ownerIdentity, validateSubmission } from './site-management.ts'
 
 const key = 'ab'.repeat(32)
-const submission = { name: 'Site', website: 'https://example.com', foundedAt: '2020-02-29', description: 'Description', models: 'OpenAI', informationValid: true }
+const submission = { name: 'Site', website: 'https://example.com', foundedAt: '2020-02-29', description: 'Description', models: 'OpenAI', billingType: '按量计费', invoice: false, informationValid: true }
 const user = { id: 7, login: 'same-login', html_url: 'https://github.com/same-login' }
 type Call = { sql: string; values: unknown[] }
 function fixture() {
@@ -44,6 +44,62 @@ test('submission validates required strings, limits, HTTP URLs and real nonfutur
 test('submission requires only explicit public-information confirmation', () => {
   for (const value of [false, undefined, 'true', 1]) assert.throws(() => validateSubmission({ ...submission, informationValid: value }))
   assert.equal(validateSubmission(submission).name, 'Site')
+})
+
+test('invoice requires an explicit boolean and persists both supported and unsupported values', async () => {
+  for (const invoice of [undefined, null, 'true', 'false', 0, 1]) {
+    assert.throws(() => validateSubmission({ ...submission, invoice }))
+    assert.equal((await fixture().request('/api/submissions', 'POST', { ...submission, invoice })).status, 400)
+  }
+  for (const invoice of [true, false]) {
+    const f = fixture()
+    assert.equal((await f.request('/api/submissions', 'POST', { ...submission, invoice })).status, 201)
+    assert.match(f.calls[0].sql, /invoice_supported/)
+    assert.equal(f.calls[0].values.at(-3), invoice)
+  }
+})
+
+test('owner invoice mutations require revision review', async () => {
+  const f = fixture()
+  assert.equal((await f.request('/api/user/sites/1/invoice', 'PATCH', { invoice: true })).status, 409)
+  assert.equal((await f.request('/api/user/sites/1/invoice', 'PATCH', {}, { signedIn: false })).status, 401)
+  assert.equal(f.calls.length, 0)
+})
+
+test('directory preserves unknown invoice values and converts stored flags to booleans', async () => {
+  const f = fixture()
+  f.setRows([{ invoice: null }, { invoice: 0 }, { invoice: 1 }])
+  const result = await f.request('/api/directory', 'GET', {}, { signedIn: false })
+  assert.deepEqual((result.payload.sites as { invoice: boolean | null }[]).map(s => s.invoice), [null, false, true])
+  assert.match(f.calls[0].sql, /s.invoice_supported AS invoice/)
+})
+
+test('billing types are required and descriptions are bounded strings', async () => {
+  for (const billingType of [undefined, null, '', 'invalid', 1]) {
+    assert.throws(() => validateSubmission({ ...submission, billingType }))
+    assert.equal((await fixture().request('/api/submissions', 'POST', { ...submission, billingType })).status, 400)
+  }
+  for (const billingDetails of [null, 1, 'x'.repeat(1001)]) assert.throws(() => validateSubmission({ ...submission, billingDetails }))
+  for (const billingType of ['按量计费', '按次计费', '包月订阅', '混合计费', '其他']) {
+    const f = fixture()
+    assert.equal((await f.request('/api/submissions', 'POST', { ...submission, billingType, billingDetails: '  details  ' })).status, 201)
+    assert.match(f.calls[0].sql, /billing_type, billing_details/)
+    assert.deepEqual(f.calls[0].values.slice(-2), [billingType, 'details'])
+  }
+})
+
+test('owner billing and logo mutations require revision review', async () => {
+  const f = fixture()
+  for (const [path, method] of [['billing', 'PATCH'], ['logo', 'PATCH'], ['logo/refetch', 'POST'], ['logo/preview', 'POST']]) assert.equal((await f.request('/api/user/sites/1/' + path, method)).status, 409)
+  assert.equal(f.calls.length, 0)
+})
+
+test('directory exposes saved billing type and details without inventing legacy values', async () => {
+  const f = fixture()
+  f.setRows([{ billingType: '按量计费', billingDetails: 'details' }, { billingType: null, billingDetails: null }])
+  const result = await f.request('/api/directory', 'GET', {}, { signedIn: false })
+  assert.match(f.calls[0].sql, /s.billing_type AS billingType, s.billing_details AS billingDetails/)
+  assert.deepEqual((result.payload.sites as Record<string, unknown>[]).map(s => s.billingType), ['按量计费', null])
 })
 
 test('stable namespaced ownership never uses login and preserves full OAuth IDs', () => {
@@ -86,7 +142,7 @@ test('owner listing retains legacy fields, boolean flags, OAuth scope and legacy
   assert.equal((result.payload.sites as Record<string, unknown>[])[0].hasCredential, true)
   assert.equal((result.payload.sites as Record<string, unknown>[])[0].directoryListed, false)
   await f.request('/api/user/sites', 'GET', {}, { local: 8 })
-  assert.deepEqual(f.calls[1].values, ['local:8', 8, 8])
+  assert.deepEqual(f.calls[2].values, ['local:8', 8, 8])
 })
 
 test('listing consent is strictly boolean and requires a locked approved owned record', async () => {
@@ -152,16 +208,21 @@ test('website uniqueness conflicts roll back review without provider takeover or
 test('automatic additive migration creates nullable site columns and default-off directory consent idempotently', async () => {
   const columns = new Set(['local_owner_verified', 'email_verified_at', 'source_id', 'capability_metadata', 'release_date', 'provider_icon_url'])
   const alters: string[] = []
+  const creates: string[] = []
   const database = {
     all: async () => [...columns].map(Field => ({ Field })),
-    run: async (sql: string) => { if (sql.startsWith('ALTER TABLE')) { alters.push(sql); columns.add(sql.match(/ADD COLUMN (\w+)/)![1]) } },
+    run: async (sql: string) => { if (sql.startsWith('CREATE TABLE')) creates.push(sql); if (sql.startsWith('ALTER TABLE')) { alters.push(sql); columns.add(sql.match(/ADD COLUMN (\w+)/)![1]) } },
   } as unknown as Database
   await initializeDatabase(database)
-  assert.equal(alters.length, 12)
+  assert.equal(alters.length, 15)
+  const revisions = creates.find(sql => sql.startsWith('CREATE TABLE IF NOT EXISTS site_revisions'))!
+  assert.match(revisions, /proposal JSON NOT NULL/)
+  assert.match(revisions, /GENERATED ALWAYS AS \(CASE WHEN status = 'pending' THEN submission_id ELSE NULL END\) STORED/)
+  assert.match(revisions, /UNIQUE KEY uq_site_revision_pending \(pending_submission_id\)/)
   assert.ok(alters.includes('ALTER TABLE submissions ADD COLUMN founded_at DATE NULL'))
   assert.ok(alters.includes('ALTER TABLE submissions ADD COLUMN directory_listed TINYINT(1) NOT NULL DEFAULT 0'))
   await initializeDatabase(database)
-  assert.equal(alters.length, 12)
+  assert.equal(alters.length, 15)
 })
 
 

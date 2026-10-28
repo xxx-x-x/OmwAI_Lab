@@ -1,5 +1,6 @@
 import { Ai2, Ai21, Alibaba, Anthropic, Aws, Baidu, ByteDance, Claude, Cohere, CommandA, DeepSeek, Doubao, Gemini, Google, Grok, IBM, Kimi, LG, Liquid, LongCat, Meta, Microsoft, Minimax, Mistral, Moonshot, NousResearch, Nova, Nvidia, OpenAI, Perplexity, Qwen, Reka, Stepfun, Tencent, TII, Upstage, Volcengine, XAI, XiaomiMiMo, Yi, Zhipu } from '@lobehub/icons'
 import type { ComponentType } from 'react'
+import { useTheme } from './useTheme'
 
 type BrandIcon = ComponentType<{ size: number }>
 
@@ -10,6 +11,8 @@ const brandIcons: Record<string, BrandIcon> = {
   'Allen Institute for AI': Ai2,
   Amazon: Aws.Color,
   Anthropic: Anthropic.Avatar,
+  Claude: Claude.Color,
+  Grok: Grok.Avatar,
   Baidu,
   'ByteDance Seed': ByteDance,
   Cohere: Cohere.Color,
@@ -67,8 +70,9 @@ const modelIcons: Array<[RegExp, BrandIcon]> = [
 ]
 
 export function ModelBrandIcon({ brand, model, size = 24 }: { brand: string; model?: string; size?: number }) {
+  const { theme } = useTheme()
   if (model && /\bkimi\b/i.test(model)) return <Kimi.Avatar size={size} shape="square" />
   const Icon = model ? modelIcons.find(([pattern]) => pattern.test(model))?.[1] ?? brandIcons[brand] : brandIcons[brand]
-  const color = Icon === OpenAI || (model && /\bgrok\b/i.test(model)) ? '#000' : undefined
+  const color = Icon === OpenAI || (model && /\bgrok\b/i.test(model)) ? (theme === 'dark' ? '#fff' : '#000') : undefined
   return Icon ? <span style={color ? { color } : undefined}><Icon size={size} /></span> : <span aria-hidden="true">{brand.slice(0, 1)}</span>
 }

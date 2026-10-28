@@ -425,7 +425,7 @@ function createAuthMiddleware(clientId: string, clientSecret: string, googleClie
       response.setHeader('set-cookie', 'omwai_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0')
       return json(response, 200, { ok: true })
     }
-    if (url.pathname === '/api/directory' || url.pathname === '/api/submissions' || url.pathname === '/api/user/sites' || /^\/api\/user\/sites\/\d+\/(listing|logo(?:\/(preview|refetch|image))?)$/.test(url.pathname)) {
+    if (url.pathname === '/api/directory' || url.pathname === '/api/submissions' || url.pathname === '/api/user/sites' || /^\/api\/user\/sites\/\d+\/(listing|invoice|billing|revision|logo(?:\/(preview|refetch|image))?)$/.test(url.pathname)) {
       return handleSiteManagement({ database, request, response, url, user, localUserId: user ? session?.localUserId ?? null : null, key: siteKey, readJson, json })
     }
     if (url.pathname.startsWith('/api/admin/')) {
@@ -448,7 +448,7 @@ function createAuthMiddleware(clientId: string, clientSecret: string, googleClie
         const counts = await database.prepare("SELECT (SELECT COUNT(*) FROM submissions WHERE status = 'pending') AS pending, (SELECT COUNT(*) FROM managed_providers WHERE active = 1) AS providers, (SELECT COUNT(*) FROM users) AS users, (SELECT COUNT(*) FROM audit_logs) AS logs").get()
         return json(response, 200, { counts })
       }
-      if (/^\/api\/admin\/providers\/\d+\/logo(?:\/(preview|refetch|image))?$/.test(url.pathname) || url.pathname === '/api/admin/submissions' || /^\/api\/admin\/submissions\/\d+$/.test(url.pathname)) {
+      if (/^\/api\/admin\/providers\/\d+\/logo(?:\/(preview|refetch|image))?$/.test(url.pathname) || url.pathname === '/api/admin/submissions' || /^\/api\/admin\/submissions\/\d+$/.test(url.pathname) || /^\/api\/admin\/site-revisions(?:\/\d+)?$/.test(url.pathname)) {
         return handleSiteManagement({ database, request, response, url, user, localUserId: session?.localUserId ?? null, adminId: adminAccount.id, key: siteKey, readJson, json, onApproved: siteLogos.schedule })
       }
       if (url.pathname === '/api/admin/providers' && request.method === 'GET') return json(response, 200, { providers: await database.prepare('SELECT p.*, s.submitter_login, s.status AS submission_status FROM managed_providers p LEFT JOIN submissions s ON s.id = p.submission_id ORDER BY p.created_at DESC').all() })
