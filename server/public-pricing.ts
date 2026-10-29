@@ -7,7 +7,7 @@ import type { Database } from './mysql.js'
 import { ownerIdentity, type SiteOwner } from './site-management.ts'
 import { groupFields, groupJoin, parsePublicGroups, storePublicGroups } from './public-groups.ts'
 
-export type PublicQuote = { modelId: string; groupName: string; groupMultiplier: number; currency: 'USD'; billingUnit: '1M tokens'; inputPrice: string; outputPrice: string }
+export type PublicQuote = { modelId: string; groupName: string; groupMultiplier: number; currency: 'USD'; billingUnit: '1M tokens'; inputPrice: string; outputPrice: string; cacheReadPrice: string | null }
 const day = 24 * 60 * 60 * 1000
 const errors: Record<string, string> = { unsupported_platform: 'This platform has no verified public pricing interface.', invalid_data: 'No valid supported public token prices were returned.', no_public_groups: 'The public Model Plaza returned no public pricing groups.', upstream_unavailable: 'The public pricing interface could not be read safely.', disabled: 'Public pricing sync is disabled.', throttled: 'Please wait five minutes before syncing again.', changed: 'Pricing settings changed; retry the sync.' }
 class SyncError extends Error {}
@@ -31,7 +31,7 @@ export function parseNewApiPricing(payload: unknown) {
       const key = JSON.stringify([row.model_name, group])
       if (keys.has(key)) throw new SyncError('invalid_data')
       keys.add(key)
-      quotes.push({ modelId: row.model_name, groupName: group, groupMultiplier: payload.group_ratio[group], currency: 'USD', billingUnit: '1M tokens', inputPrice: input.toFixed(8), outputPrice: output.toFixed(8) })
+      quotes.push({ modelId: row.model_name, groupName: group, groupMultiplier: payload.group_ratio[group], currency: 'USD', billingUnit: '1M tokens', inputPrice: input.toFixed(8), outputPrice: output.toFixed(8), cacheReadPrice: null })
       if (quotes.length > 10000) throw new SyncError('invalid_data')
     }
   }
@@ -50,13 +50,14 @@ export function parseSub2ApiPricing(payload: unknown) {
     if (!object(group) || !Array.isArray(group.models)) { unsupportedCount++; continue }
     for (const model of group.models) {
       const p = object(model) && object(model.pricing) ? model.pricing : null
-      if (!label(group.name) || !ratio(group.rate_multiplier) || group.user_rate_multiplier != null || group.peak_rate_enabled || !object(model) || !label(model.name) || !p || p.billing_mode !== 'token' || !ratio(p.input_price) || !ratio(p.output_price) || (p.intervals != null && (!Array.isArray(p.intervals) || p.intervals.length > 0)) || model.long_context_basis || (model.time_pricing != null && (!object(model.time_pricing) || !Array.isArray(model.time_pricing.periods) || model.time_pricing.periods.length > 0)) || (p.reasoning_effort_multipliers != null && (!object(p.reasoning_effort_multipliers) || Object.keys(p.reasoning_effort_multipliers).length > 0))) { unsupportedCount++; continue }
+      if (!label(group.name) || !ratio(group.rate_multiplier) || group.user_rate_multiplier != null || group.peak_rate_enabled || !object(model) || !label(model.name) || !p || p.billing_mode !== 'token' || !ratio(p.input_price) || !ratio(p.output_price) || (p.cache_read_price != null && !ratio(p.cache_read_price)) || (p.intervals != null && (!Array.isArray(p.intervals) || p.intervals.length > 0)) || model.long_context_basis || (model.time_pricing != null && (!object(model.time_pricing) || !Array.isArray(model.time_pricing.periods) || model.time_pricing.periods.length > 0)) || (p.reasoning_effort_multipliers != null && (!object(p.reasoning_effort_multipliers) || Object.keys(p.reasoning_effort_multipliers).length > 0))) { unsupportedCount++; continue }
       const input = p.input_price * group.rate_multiplier * 1e6, output = p.output_price * group.rate_multiplier * 1e6
-      if (!Number.isFinite(input) || !Number.isFinite(output) || input >= 1e12 || output >= 1e12 || (input > 0 && input < 1e-8) || (output > 0 && output < 1e-8)) { unsupportedCount++; continue }
+      const cacheRead = p.cache_read_price == null ? null : p.cache_read_price * group.rate_multiplier * 1e6
+      if (!Number.isFinite(input) || !Number.isFinite(output) || (cacheRead !== null && !Number.isFinite(cacheRead)) || input >= 1e12 || output >= 1e12 || (cacheRead !== null && cacheRead >= 1e12) || (input > 0 && input < 1e-8) || (output > 0 && output < 1e-8) || (cacheRead !== null && cacheRead > 0 && cacheRead < 1e-8)) { unsupportedCount++; continue }
       const key = JSON.stringify([model.name, group.name])
       if (keys.has(key)) throw new SyncError('invalid_data')
       keys.add(key)
-      quotes.push({ modelId: model.name, groupName: group.name, groupMultiplier: group.rate_multiplier, currency: 'USD', billingUnit: '1M tokens', inputPrice: input.toFixed(8), outputPrice: output.toFixed(8) })
+      quotes.push({ modelId: model.name, groupName: group.name, groupMultiplier: group.rate_multiplier, currency: 'USD', billingUnit: '1M tokens', inputPrice: input.toFixed(8), outputPrice: output.toFixed(8), cacheReadPrice: cacheRead?.toFixed(8) ?? null })
       if (quotes.length > 10000) throw new SyncError('invalid_data')
     }
   }
@@ -118,7 +119,7 @@ export async function fetchPublicPricing(url: URL): Promise<unknown> {
   })
 }
 
-const quoteFields = `CONCAT('sync-', q.id) AS id, q.model_id AS modelId, q.group_name AS groupName, q.group_multiplier AS groupMultiplier, q.currency, q.billing_unit AS billingUnit, q.input_price AS inputPrice, q.output_price AS outputPrice, q.source_url AS sourceUrl, 'public-interface' AS sourceType, 'reference' AS sourceStatus, q.synced_at AS syncedAt`
+const quoteFields = `CONCAT('sync-', q.id) AS id, q.model_id AS modelId, q.group_name AS groupName, q.group_multiplier AS groupMultiplier, q.currency, q.billing_unit AS billingUnit, q.input_price AS inputPrice, q.output_price AS outputPrice, q.cache_read_price AS cacheReadPrice, q.source_url AS sourceUrl, 'public-interface' AS sourceType, 'reference' AS sourceStatus, q.synced_at AS syncedAt`
 const stale = (value: unknown) => !value || !Number.isFinite(new Date(String(value)).getTime()) || Date.now() - new Date(String(value)).getTime() > day
 export async function publicComparisonQuotes(db: Database, model: string) {
   const query = `SELECT ${quoteFields.replace('q.group_multiplier AS groupMultiplier, ', '')}, ${groupFields}, ps.platform, s.id AS siteId, CONCAT('managed-', p.id) AS providerId, s.name AS siteName, s.website, 1 AS verified, CASE WHEN l.image IS NOT NULL AND l.website = p.website THEN CONCAT('/api/site-logos/', p.id, '?v=', l.digest) ELSE NULL END AS logoUrl FROM site_public_quotes q JOIN site_pricing_settings ps ON ps.submission_id = q.submission_id JOIN submissions s ON s.id = q.submission_id JOIN managed_providers p ON p.submission_id = s.id LEFT JOIN site_logos l ON l.provider_id = p.id ${groupJoin} WHERE BINARY q.model_id = BINARY ? AND s.status = 'approved' AND s.directory_listed = 1 AND p.active = 1 AND ps.enabled = 1 ORDER BY q.id DESC LIMIT 500`
@@ -197,7 +198,7 @@ export async function handlePublicPricing(c: Context) {
           const settings = await db.get('SELECT enabled, platform, revision FROM site_pricing_settings WHERE submission_id = ? FOR UPDATE', [id], connection)
           if (!settings?.enabled || Number(settings.revision) !== claim.revision || settings.platform !== claim.platform) throw new SyncError('changed')
           await db.run('DELETE FROM site_public_quotes WHERE submission_id = ?', [id], connection)
-          for (const q of parsed.quotes) await db.run('INSERT INTO site_public_quotes (submission_id, model_id, group_name, currency, billing_unit, input_price, output_price, source_url, group_multiplier) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [id, q.modelId, q.groupName, q.currency, q.billingUnit, q.inputPrice, q.outputPrice, source.href, q.groupMultiplier], connection)
+          for (const q of parsed.quotes) await db.run('INSERT INTO site_public_quotes (submission_id, model_id, group_name, currency, billing_unit, input_price, output_price, cache_read_price, source_url, group_multiplier) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [id, q.modelId, q.groupName, q.currency, q.billingUnit, q.inputPrice, q.outputPrice, q.cacheReadPrice, source.href, q.groupMultiplier], connection)
           await db.run('UPDATE site_pricing_settings SET synced_at = CURRENT_TIMESTAMP, error_code = NULL, unsupported_count = ? WHERE submission_id = ?', [parsed.unsupportedCount, id], connection)
         })
         return send(200, await snapshot())

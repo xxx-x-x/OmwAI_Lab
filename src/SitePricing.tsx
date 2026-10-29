@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { RefreshCw } from 'lucide-react'
 
-type Quote = { id: string | number; modelId: string; groupName: string; inputPrice: string | number | null; outputPrice: string | number | null; currency: string; billingUnit: string }
+type Quote = { id: string | number; modelId: string; groupName: string; inputPrice: string | number | null; outputPrice: string | number | null; cacheReadPrice: string | number | null; currency: string; billingUnit: string }
 type Pricing = { settings: { enabled: boolean; platform: 'new-api' | 'sub2api' }; sync: { syncedAt?: string | null; error?: string | null; unsupportedCount?: number } | null; quotes: Quote[] }
 type Groups = { groups: { name: string; ratio: number; type: string; description: string; modelCount: number }[]; detectedAt: string | null }
 
@@ -57,7 +57,7 @@ export default function SitePricing({ siteId }: { siteId: number }) {
       {names.length ? <div className="group-management-list">{names.map(name => {
         const group = groups?.groups.find(item => item.name === name)
         const quotes = data.quotes.filter(quote => quote.groupName === name)
-        return <article className="group-management-card" key={name}><div className="group-management-card-heading"><div><h4>{name}</h4><span>{group?.type || '历史报价分组'} · {group?.modelCount ? `${group.modelCount} 个模型` : '模型数未公开'}</span></div><strong>{group ? `${group.ratio}×` : '倍率未知'}</strong></div>{group?.description && <p>{group.description}</p>}{quotes.length ? <details><summary>模型报价 · {quotes.length} 条</summary><div className="admin-table-wrap"><table><thead><tr><th>模型</th><th>输入</th><th>输出</th><th>币种 / 单位</th></tr></thead><tbody>{quotes.map((quote, index) => <tr key={quote.id ?? index}><td>{quote.modelId}</td><td>{quote.inputPrice ?? '—'}</td><td>{quote.outputPrice ?? '—'}</td><td>{quote.currency} / {quote.billingUnit}</td></tr>)}</tbody></table></div></details> : <p className="group-management-no-quotes">暂无已保存的模型报价</p>}</article>
+        return <article className="group-management-card" key={name}><div className="group-management-card-heading"><div><h4>{name}</h4><span>{group?.type || '历史报价分组'} · {group?.modelCount ? `${group.modelCount} 个模型` : '模型数未公开'}</span></div><strong>{group ? `${group.ratio}×` : '倍率未知'}</strong></div>{group?.description && <p>{group.description}</p>}{quotes.length ? <details><summary>模型报价 · {quotes.length} 条</summary><div className="admin-table-wrap"><table><thead><tr><th>模型</th><th>输入</th><th>输出</th><th>缓存读取</th><th>币种 / 单位</th></tr></thead><tbody>{quotes.map((quote, index) => <tr key={quote.id ?? index}><td>{quote.modelId}</td><td>{quote.inputPrice ?? '—'}</td><td>{quote.outputPrice ?? '—'}</td><td>{quote.cacheReadPrice ?? '—'}</td><td>{quote.currency} / {quote.billingUnit}</td></tr>)}</tbody></table></div></details> : <p className="group-management-no-quotes">暂无已保存的模型报价</p>}</article>
       })}</div> : <div className="empty-state"><h3>暂无分组数据</h3><p>确认站点系统后，点击右上角“同步分组”。</p></div>}
       <p className="group-management-hint">模型报价为公开参考标价，不代表实际扣费；分组与报价更新时间可能不同，请以站点实际计费为准。</p>
     </>}

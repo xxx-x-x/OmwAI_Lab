@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom'
 import { BadgeCheck, ShieldQuestion } from 'lucide-react'
 import { compareMultipliers, lowestPerSite, multiplier } from './comparisonQuotes'
 
-type Quote = { id: number | string; logoUrl?: string | null; verified?: boolean | number; groupMultiplier?: number | string | null; groupMultiplierDetectedAt?: string | null; groupMultiplierSourceUrl?: string | null; groupMultiplierSource?: string | null; sourceType?: string; sourceStatus?: string; syncedAt?: string | null; stale?: boolean; siteId?: number; providerId?: string | null; siteName?: string; website?: string; groupName: string; modelId: string; currency: string; billingUnit: string; inputPrice: string | null; outputPrice: string | null; sourceUrl: string; status?: string; reviewedAt?: string | null }
+type Quote = { id: number | string; logoUrl?: string | null; verified?: boolean | number; groupMultiplier?: number | string | null; groupMultiplierDetectedAt?: string | null; groupMultiplierSourceUrl?: string | null; groupMultiplierSource?: string | null; sourceType?: string; sourceStatus?: string; syncedAt?: string | null; stale?: boolean; siteId?: number; providerId?: string | null; siteName?: string; website?: string; groupName: string; modelId: string; currency: string; billingUnit: string; inputPrice: string | null; outputPrice: string | null; cacheReadPrice?: string | null; sourceUrl: string; status?: string; reviewedAt?: string | null }
 
 async function api<T>(url: string, method = 'GET', body?: unknown): Promise<T> {
   const response = await fetch(url, { method, headers: body ? { 'content-type': 'application/json' } : undefined, body: body ? JSON.stringify(body) : undefined })
@@ -54,7 +54,7 @@ export function SiteComparison({ modelId }: { modelId: string }) {
     <div className="price-table-wrap site-comparison-table">
       <div className="price-table-meta"><span>共找到 <strong>{visible.length}</strong> 条报价 · <strong>{new Set(visible.map(q => q.siteId ?? q.website ?? q.siteName)).size}</strong> 个站点</span><small>每站仅展示最低倍率分组；倍率未知时保留一条，需站长重新同步。</small></div>
       <div className="price-table-scroll" role="region" aria-label="站点分组报价对比表，可横向滚动" tabIndex={0}>
-        <table className="price-table"><thead><tr><th scope="col">序号</th><th scope="col">站点</th><th scope="col">分组</th><th scope="col">分组倍率</th><th scope="col">输入价格 / 单位</th><th scope="col">输出价格 / 单位</th></tr></thead><tbody>{visible.map((q, index) => {
+        <table className="price-table"><thead><tr><th scope="col">序号</th><th scope="col">站点</th><th scope="col">分组</th><th scope="col">分组倍率</th><th scope="col">输入价格 / 单位</th><th scope="col">输出价格 / 单位</th><th scope="col">缓存读取价格 / 单位</th></tr></thead><tbody>{visible.map((q, index) => {
           return <tr key={q.id}>
             <td><b>{index + 1}</b></td>
             <td><ComparisonSite quote={q} /></td>
@@ -62,6 +62,7 @@ export function SiteComparison({ modelId }: { modelId: string }) {
             <td title={q.groupMultiplierSource === 'group-probe' ? `独立获取的分组倍率，非价格同一快照；获取时间：${q.groupMultiplierDetectedAt || '未知'}；来源：${q.groupMultiplierSourceUrl || '未知'}` : q.groupMultiplierSource === 'price-snapshot' ? `价格同一快照倍率；获取时间：${q.groupMultiplierDetectedAt || '未知'}；来源：${q.groupMultiplierSourceUrl || '未知'}` : undefined}><b>{multiplier(q) == null ? '倍率未知' : `${multiplier(q)}×`}</b>{q.groupMultiplierSource === 'group-probe' && <small className="price-unit">独立获取 · 非同一快照</small>}</td>
             <td><b>{displayPrice(q.inputPrice, q.currency || '未提供')}</b>{q.inputPrice != null && <small className="price-unit"> / {q.billingUnit || '未提供'}</small>}</td>
             <td><b>{displayPrice(q.outputPrice, q.currency || '未提供')}</b>{q.outputPrice != null && <small className="price-unit"> / {q.billingUnit || '未提供'}</small>}</td>
+            <td><b>{displayPrice(q.cacheReadPrice ?? null, q.currency || '未提供')}</b>{q.cacheReadPrice != null && <small className="price-unit"> / {q.billingUnit || '未提供'}</small>}</td>
           </tr>
         })}</tbody></table>
         {!visible.length && <div className="price-empty"><strong>没有符合筛选条件的报价。</strong></div>}

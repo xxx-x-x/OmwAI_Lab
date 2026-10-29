@@ -9,20 +9,22 @@ const payload = { success: true, data: [row], group_ratio: { standard: 0.5 } }
 test('new-api uses explicit token and group ratios, never price or fallback defaults', () => {
   assert.equal(parseNewApiPricing({ ...payload, data: [{ ...row, billing_mode: 'ratio' }] }).quotes.length, 1)
   const parsed = parseNewApiPricing(payload)
-  assert.deepEqual(parsed.quotes[0], { modelId: 'Exact-Model', groupName: 'standard', groupMultiplier: 0.5, currency: 'USD', billingUnit: '1M tokens', inputPrice: '1.50000000', outputPrice: '6.00000000' })
+  assert.deepEqual(parsed.quotes[0], { modelId: 'Exact-Model', groupName: 'standard', groupMultiplier: 0.5, currency: 'USD', billingUnit: '1M tokens', inputPrice: '1.50000000', outputPrice: '6.00000000', cacheReadPrice: null })
   for (const change of [{ quota_type: 1 }, { completion_ratio: undefined }, { model_ratio: '1' }, { billing_expr: 'tiered' }, { billing_mode: 'tiered' }, { enable_groups: [] }, { enable_groups: ['unknown'] }]) assert.throws(() => parseNewApiPricing({ ...payload, data: [{ ...row, ...change }] }))
   assert.equal(parseNewApiPricing({ ...payload, data: [row, { ...row, quota_type: 1 }] }).unsupportedCount, 1)
   assert.throws(() => parseNewApiPricing({ ...payload, success: false }))
   assert.throws(() => parseNewApiPricing({ ...payload, data: [row, row] }))
 })
 test('sub2api verified public model plaza retail formula excludes tiered/peak/time prices', () => {
-  const model = { name: 'exact', pricing: { billing_mode: 'token', input_price: 0.000002, output_price: 0.000008 } }
+  const model = { name: 'exact', pricing: { billing_mode: 'token', input_price: 0.000002, output_price: 0.000008, cache_read_price: 0.000001 } }
   const group = { name: 'group', rate_multiplier: 0.5, models: [model] }
   const wrap = (g: unknown) => ({ code: 0, data: { groups: [g] } })
   assert.throws(() => parseSub2ApiPricing({ code: 0, message: 'success', data: { groups: [] } }), /no_public_groups/)
   assert.equal(parseSub2ApiPricing(wrap(group)).quotes[0].groupMultiplier, 0.5)
   assert.equal(parseSub2ApiPricing(wrap(group)).quotes[0].inputPrice, '1.00000000')
   assert.equal(parseSub2ApiPricing(wrap(group)).quotes[0].outputPrice, '4.00000000')
+  assert.equal(parseSub2ApiPricing(wrap(group)).quotes[0].cacheReadPrice, '0.50000000')
+  assert.equal(parseSub2ApiPricing(wrap({ ...group, models: [{ ...model, pricing: { ...model.pricing, cache_read_price: 0 } }] })).quotes[0].cacheReadPrice, '0.00000000')
   for (const change of [{ peak_rate_enabled: true }, { rate_multiplier: undefined }, { user_rate_multiplier: 0 }]) assert.throws(() => parseSub2ApiPricing(wrap({ ...group, ...change })))
   for (const change of [{ long_context_basis: 'tokens' }, { time_pricing: { periods: [{}] } }, { pricing: { ...model.pricing, intervals: [{}] } }, { pricing: { ...model.pricing, billing_mode: 'per_request' } }]) assert.throws(() => parseSub2ApiPricing(wrap({ ...group, models: [{ ...model, ...change }] })))
   assert.equal(publicPricingUrl('https://example.com/site', 'sub2api').pathname, '/api/v1/model-plaza')
@@ -93,8 +95,10 @@ test('sync snapshots replace atomically, throttle and retain last successful quo
   const success = await f.request()
   assert.equal(success.body.quotes.length, 1)
   const insert = f.calls.find(call => call.sql.startsWith('INSERT INTO site_public_quotes'))!
+  assert.match(insert.sql, /cache_read_price/)
   assert.match(insert.sql, /group_multiplier/)
-  assert.equal(insert.values[8], 0.5)
+  assert.equal(insert.values[7], null)
+  assert.equal(insert.values[9], 0.5)
   assert.equal(success.body.sync.stale, false)
   assert.equal((await f.request('POST', {}, { sync: true })).status, 429)
   assert.equal(f.fetched(), 1)
@@ -107,6 +111,14 @@ test('sync snapshots replace atomically, throttle and retain last successful quo
   assert.equal((await f.request('POST', {}, { sync: true })).body.quotes.length, 1)
   f.resetThrottle(); f.setUpstream(payload); f.failInsert()
   assert.equal((await f.request('POST', {}, { sync: true })).body.quotes.length, 1)
+})
+test('Sub2API cache-read prices are persisted with the group multiplier', async () => {
+  const f = fixture()
+  await f.request('PATCH', { enabled: true, platform: 'sub2api' })
+  f.setUpstream({ code: 0, data: { groups: [{ name: 'standard', rate_multiplier: 0.5, models: [{ name: 'Exact-Model', pricing: { billing_mode: 'token', input_price: 0.000002, output_price: 0.000008, cache_read_price: 0.000001 } }] }] } })
+  assert.equal((await f.request('POST', {}, { sync: true })).status, 200)
+  const insert = f.calls.find(call => call.sql.startsWith('INSERT INTO site_public_quotes'))!
+  assert.equal(insert.values[7], '0.50000000')
 })
 test('public projection is exact, public-only, opted-in active and credential independent', async () => {
   const f = fixture()
