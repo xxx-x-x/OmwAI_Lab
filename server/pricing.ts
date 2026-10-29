@@ -1,4 +1,5 @@
 export type PriceRow = {
+  sourceId?: string
   providerId: string
   modelId: string
   name: string
@@ -12,7 +13,7 @@ export type PriceRow = {
   reasoning: number
   openWeights: number
   sourceUrl: string
-  modality?: 'image' | 'video'
+  modality?: 'text' | 'image' | 'video' | 'audio'
   billingUnit?: string
   pricingDetails?: string
   sourceName?: string
@@ -57,7 +58,7 @@ const excludedProviders = new Set([
   'poolside', 'sakana', 'sarvam', 'stepfun-ai', 'thinkingmachines', 'upstage',
 ])
 
-const versionSuffix = /(?:\s*\((?:latest|preview|non[- ]?reasoning|reasoning|thinking|\d{4}[-/]\d{2}[-/]\d{2})\)|\s+\d{4}[-/]\d{2}[-/]\d{2}|\s+\d{8})$/i
+const versionSuffix = /(?:\s*\((?:latest|preview|\d{4}[-/]\d{2}[-/]\d{2})\)|\s+\d{4}[-/]\d{2}[-/]\d{2}|\s+\d{8})$/i
 
 function baseName(name: string) {
   let result = name.trim()
@@ -74,7 +75,9 @@ function displayName(row: PriceRow) {
 
 function priority(row: PriceRow) {
   const id = row.modelId.toLowerCase()
-  return [row.inputPrice != null || row.outputPrice != null ? 0 : 1,
+  return [row.sourceId === 'manual' ? 0 : 1,
+    row.inputPrice != null || row.outputPrice != null ? 0 : 1,
+    row.sourceId === 'curated' ? 0 : 1,
     /(?:[-_](?:preview|latest|reasoning|non-reasoning|thinking|\d{4}[-/]?\d{2}(?:[-/]?\d{2})?|\d{8}))$/.test(id) ? 1 : 0,
     id.length]
 }
@@ -87,10 +90,16 @@ function preferred(a: PriceRow, b: PriceRow) {
 }
 
 export function mergePrices(rows: PriceRow[]) {
-  const groups = new Map<string, PriceRow>()
+  const identities = new Map<string, PriceRow>()
   for (const row of rows) {
+    const key = `${row.providerId}:${row.modelId}:${row.reasoning}:${row.modality ?? 'text'}`
+    const existing = identities.get(key)
+    if (!existing || preferred(row, existing)) identities.set(key, row)
+  }
+  const groups = new Map<string, PriceRow>()
+  for (const row of identities.values()) {
     if (excludedProviders.has(row.providerId.toLowerCase())) continue
-    const key = `${row.providerId.toLowerCase()}:${baseName(row.name).toLowerCase()}`
+    const key = `${row.providerId.toLowerCase()}:${baseName(row.name).toLowerCase()}:${Number(row.reasoning)}:${row.modality ?? 'text'}`
     const existing = groups.get(key)
     if (!existing || preferred(row, existing)) groups.set(key, row)
   }
@@ -108,13 +117,13 @@ export function mergePrices(rows: PriceRow[]) {
     pricingDetails: row.pricingDetails ?? '',
     priceCheckedAt: row.priceCheckedAt,
     priceSource: row.inputPrice != null || row.outputPrice != null
-      ? row.providerId === 'volcengine' ? `${row.sourceName ?? 'BaseLLM'} 人民币报价折算（1 USD = ${VOLCENGINE_CNY_PER_USD} CNY）` : row.sourceName ? `${row.sourceName}价格` : 'BaseLLM 价格'
-      : 'BaseLLM 暂无报价',
+      ? row.providerId === 'volcengine' && row.sourceId !== 'manual' ? `${row.sourceName ?? 'BaseLLM'} 人民币报价折算（1 USD = ${VOLCENGINE_CNY_PER_USD} CNY）` : row.sourceName ? `${row.sourceName}价格` : 'BaseLLM 价格'
+      : `${row.sourceName ?? 'BaseLLM'} 暂无报价`,
     inputPrice: row.inputPrice,
     outputPrice: row.outputPrice,
     cacheReadPrice: row.cacheReadPrice,
     reasoning: row.reasoning,
     openWeights: row.openWeights,
-    sourceUrl: row.inputPrice != null || row.outputPrice != null ? row.sourceUrl : '',
+    sourceUrl: row.sourceUrl,
   })).sort((a, b) => a.family.localeCompare(b.family, 'zh-CN') || a.name.localeCompare(b.name, 'zh-CN'))
 }

@@ -36,8 +36,8 @@ await initializeDatabase(database)
 const syncedAt = new Date()
 await database.transaction(async connection => {
   await database.run("DELETE FROM model_prices WHERE source_id = 'official'", [], connection)
-  const sql = `INSERT INTO model_prices (source_id, provider_id, model_id, model_key, name, provider_name, provider_icon_url, release_date, capability_metadata, input_price, output_price, cached_input_price, reasoning, open_weights, source_url, synced_at) VALUES ('official', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  for (const row of rows) await database.run(sql, [row.providerId, row.modelId, row.key, row.name, row.providerName, row.providerIconUrl, row.releaseDate, row.capabilityMetadata, row.input, row.output, row.cacheRead, row.reasoning, row.openWeights, row.source, syncedAt], connection)
+  const sql = `INSERT INTO model_prices (source_id, provider_id, model_id, model_key, name, provider_name, provider_icon_url, release_date, capability_metadata, input_price, output_price, cached_input_price, reasoning, open_weights, source_url, source_name, price_checked_at, synced_at) VALUES ('official', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'BaseLLM', ?, ?)`
+  for (const row of rows) await database.run(sql, [row.providerId, row.modelId, row.key, row.name, row.providerName, row.providerIconUrl, row.releaseDate, row.capabilityMetadata, row.input, row.output, row.cacheRead, row.reasoning, row.openWeights, row.source, syncedAt.toISOString(), syncedAt], connection)
   await database.run('INSERT INTO model_price_syncs (source_url, model_count, provider_count, synced_at) VALUES (?, ?, ?, ?)', [INDEX_URL, rows.length, providers.length, syncedAt], connection)
 })
 await database.pool.end()

@@ -3,7 +3,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { test } from 'node:test'
 import type { Database } from './mysql.ts'
 import { initializeDatabase } from './mysql.ts'
-import { handleSiteManagement, ownerIdentity, validateSubmission } from './site-management.ts'
+import { handleSiteManagement, ownerIdentity, validateSubmission, listingDay } from './site-management.ts'
 
 const key = 'ab'.repeat(32)
 const submission = { name: 'Site', website: 'https://example.com', foundedAt: '2020-02-29', description: 'Description', models: 'OpenAI', billingType: '按量计费', invoice: false, informationValid: true }
@@ -153,13 +153,13 @@ test('listing consent is strictly boolean and requires a locked approved owned r
   }
   for (const local of [null, 8]) {
     const f = fixture()
-    assert.equal((await f.request('/api/user/sites/1/listing', 'PATCH', { listed: true }, { local })).status, 200)
+    assert.equal((await f.request('/api/user/sites/1/listing', 'PATCH', { listed: true, confirmed: true }, { local })).status, 200)
     assert.match(f.calls[0].sql, /s.status = 'approved'.*FOR UPDATE/)
     assert.deepEqual(f.calls[0].values, [1, local ? 'local:8' : 'github:7', local, local])
-    assert.deepEqual(f.calls[1].values, [true, 1])
+    assert.deepEqual(f.calls.find(c => c.sql.startsWith('UPDATE submissions SET directory_listed'))?.values, [true, 1])
     assert.equal(f.state().committed, true)
     f.setOwned(undefined)
-    assert.equal((await f.request('/api/user/sites/1/listing', 'PATCH', { listed: false }, { local })).status, 404)
+    assert.equal((await f.request('/api/user/sites/1/listing', 'PATCH', { listed: false, confirmed: true }, { local })).status, 404)
   }
 })
 
@@ -211,10 +211,12 @@ test('automatic additive migration creates nullable site columns and default-off
   const creates: string[] = []
   const database = {
     all: async () => [...columns].map(Field => ({ Field })),
-    run: async (sql: string) => { if (sql.startsWith('CREATE TABLE')) creates.push(sql); if (sql.startsWith('ALTER TABLE')) { alters.push(sql); columns.add(sql.match(/ADD COLUMN (\w+)/)![1]) } },
+    run: async (sql: string) => { if (sql.startsWith('CREATE TABLE')) creates.push(sql); if (sql.startsWith('ALTER TABLE') && sql.includes('ADD COLUMN')) { alters.push(sql); columns.add(sql.match(/ADD COLUMN (\w+)/)![1]) } },
   } as unknown as Database
   await initializeDatabase(database)
-  assert.equal(alters.length, 15)
+  const initialAlterCount = alters.length
+  assert.ok(alters.includes('ALTER TABLE submissions ADD COLUMN listing_enable_day DATE NULL'))
+  assert.ok(alters.includes('ALTER TABLE submissions ADD COLUMN listing_enable_count INT UNSIGNED NOT NULL DEFAULT 0'))
   const revisions = creates.find(sql => sql.startsWith('CREATE TABLE IF NOT EXISTS site_revisions'))!
   assert.match(revisions, /proposal JSON NOT NULL/)
   assert.match(revisions, /GENERATED ALWAYS AS \(CASE WHEN status = 'pending' THEN submission_id ELSE NULL END\) STORED/)
@@ -222,7 +224,7 @@ test('automatic additive migration creates nullable site columns and default-off
   assert.ok(alters.includes('ALTER TABLE submissions ADD COLUMN founded_at DATE NULL'))
   assert.ok(alters.includes('ALTER TABLE submissions ADD COLUMN directory_listed TINYINT(1) NOT NULL DEFAULT 0'))
   await initializeDatabase(database)
-  assert.equal(alters.length, 15)
+  assert.equal(alters.length, initialAlterCount)
 })
 
 
@@ -236,4 +238,34 @@ test('logo routes enforce authentication, approved ownership and admin scope bef
   assert.deepEqual(f.calls[0].values, [1, 'github:7', null, null])
   assert.equal((await f.request('/api/admin/providers/1/logo', 'GET', {}, { adminId: 8 })).status, 404)
   assert.doesNotMatch(f.calls[1].sql, /owner_identity/)
+})
+
+test('listing changes require confirmation and quota uses Beijing calendar day', async () => {
+  const f = fixture()
+  assert.equal((await f.request('/api/user/sites/1/listing', 'PATCH', { listed: true })).status, 400)
+  assert.equal(f.calls.length, 0)
+  assert.equal(listingDay(new Date('2026-10-29T15:59:59Z')), '2026-10-29')
+  assert.equal(listingDay(new Date('2026-10-29T16:00:00Z')), '2026-10-30')
+})
+
+test('listing enables are limited per site and day, disables and duplicate enables do not consume quota', async () => {
+  const f = fixture(), day = listingDay()
+  f.setOwned({ id: 1, directoryListed: 0, listingEnableDay: day, listingEnableCount: 2 })
+  assert.equal((await f.request('/api/user/sites/1/listing', 'PATCH', { listed: true, confirmed: true })).status, 429)
+  assert.ok(f.calls.every(c => !c.sql.startsWith('UPDATE')))
+  f.setOwned({ id: 1, directoryListed: 1, listingEnableDay: day, listingEnableCount: 2 })
+  assert.equal((await f.request('/api/user/sites/1/listing', 'PATCH', { listed: true, confirmed: true })).status, 200)
+  assert.ok(f.calls.every(c => !c.sql.startsWith('UPDATE')))
+  assert.equal((await f.request('/api/user/sites/1/listing', 'PATCH', { listed: false, confirmed: true })).status, 200)
+  assert.ok(f.calls.every(c => !c.sql.includes('SET listing_enable_day')))
+  f.setOwned({ id: 1, directoryListed: 0, listingEnableDay: day, listingEnableCount: 1 })
+  const second = await f.request('/api/user/sites/1/listing', 'PATCH', { listed: true, confirmed: true })
+  assert.equal(second.status, 200)
+  assert.equal(second.payload.listingEnableRemaining, 0)
+  assert.ok(f.calls.some(c => c.sql.includes('SET listing_enable_day') && c.values[1] === 2))
+  f.setOwned({ id: 1, directoryListed: 0, listingEnableDay: '2000-01-01', listingEnableCount: 2 })
+  const reset = await f.request('/api/user/sites/1/listing', 'PATCH', { listed: true, confirmed: true })
+  assert.equal(reset.status, 200)
+  assert.equal(reset.payload.listingEnableRemaining, 1)
+  assert.ok(f.calls.some(c => c.sql.includes('SET listing_enable_day') && c.values[1] === 1))
 })

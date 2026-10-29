@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { test } from 'node:test'
 import { Redis } from 'ioredis'
-import { AuthRedisUnavailableError, CODE_COOLDOWN_MS, CODE_TTL_MS, createAuthRedis } from './auth-redis.ts'
+import { AuthRedisUnavailableError, CODE_COOLDOWN_MS, CODE_TTL_MS, createAuthRedis } from '../dist-server/auth-redis.js'
 
 test('missing Redis fails closed for all authentication storage operations', async () => {
   const store = createAuthRedis('', undefined, 'test-secret')

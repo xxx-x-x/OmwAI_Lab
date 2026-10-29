@@ -5,8 +5,9 @@ import { isIP } from 'node:net'
 import { TLSSocket } from 'node:tls'
 import type { Database } from './mysql.js'
 import { ownerIdentity, type SiteOwner } from './site-management.ts'
+import { groupFields, groupJoin, parsePublicGroups, storePublicGroups } from './public-groups.ts'
 
-export type PublicQuote = { modelId: string; groupName: string; currency: 'USD'; billingUnit: '1M tokens'; inputPrice: string; outputPrice: string }
+export type PublicQuote = { modelId: string; groupName: string; groupMultiplier: number; currency: 'USD'; billingUnit: '1M tokens'; inputPrice: string; outputPrice: string }
 const day = 24 * 60 * 60 * 1000
 const errors: Record<string, string> = { unsupported_platform: 'This platform has no verified public pricing interface.', invalid_data: 'No valid supported public token prices were returned.', no_public_groups: 'The public Model Plaza returned no public pricing groups.', upstream_unavailable: 'The public pricing interface could not be read safely.', disabled: 'Public pricing sync is disabled.', throttled: 'Please wait five minutes before syncing again.', changed: 'Pricing settings changed; retry the sync.' }
 class SyncError extends Error {}
@@ -30,7 +31,7 @@ export function parseNewApiPricing(payload: unknown) {
       const key = JSON.stringify([row.model_name, group])
       if (keys.has(key)) throw new SyncError('invalid_data')
       keys.add(key)
-      quotes.push({ modelId: row.model_name, groupName: group, currency: 'USD', billingUnit: '1M tokens', inputPrice: input.toFixed(8), outputPrice: output.toFixed(8) })
+      quotes.push({ modelId: row.model_name, groupName: group, groupMultiplier: payload.group_ratio[group], currency: 'USD', billingUnit: '1M tokens', inputPrice: input.toFixed(8), outputPrice: output.toFixed(8) })
       if (quotes.length > 10000) throw new SyncError('invalid_data')
     }
   }
@@ -55,7 +56,7 @@ export function parseSub2ApiPricing(payload: unknown) {
       const key = JSON.stringify([model.name, group.name])
       if (keys.has(key)) throw new SyncError('invalid_data')
       keys.add(key)
-      quotes.push({ modelId: model.name, groupName: group.name, currency: 'USD', billingUnit: '1M tokens', inputPrice: input.toFixed(8), outputPrice: output.toFixed(8) })
+      quotes.push({ modelId: model.name, groupName: group.name, groupMultiplier: group.rate_multiplier, currency: 'USD', billingUnit: '1M tokens', inputPrice: input.toFixed(8), outputPrice: output.toFixed(8) })
       if (quotes.length > 10000) throw new SyncError('invalid_data')
     }
   }
@@ -117,10 +118,11 @@ export async function fetchPublicPricing(url: URL): Promise<unknown> {
   })
 }
 
-const quoteFields = `CONCAT('sync-', q.id) AS id, q.model_id AS modelId, q.group_name AS groupName, q.currency, q.billing_unit AS billingUnit, q.input_price AS inputPrice, q.output_price AS outputPrice, q.source_url AS sourceUrl, 'public-interface' AS sourceType, 'reference' AS sourceStatus, q.synced_at AS syncedAt`
+const quoteFields = `CONCAT('sync-', q.id) AS id, q.model_id AS modelId, q.group_name AS groupName, q.group_multiplier AS groupMultiplier, q.currency, q.billing_unit AS billingUnit, q.input_price AS inputPrice, q.output_price AS outputPrice, q.source_url AS sourceUrl, 'public-interface' AS sourceType, 'reference' AS sourceStatus, q.synced_at AS syncedAt`
 const stale = (value: unknown) => !value || !Number.isFinite(new Date(String(value)).getTime()) || Date.now() - new Date(String(value)).getTime() > day
 export async function publicComparisonQuotes(db: Database, model: string) {
-  const rows = await db.prepare(`SELECT ${quoteFields}, s.id AS siteId, s.name AS siteName, s.website FROM site_public_quotes q JOIN site_pricing_settings ps ON ps.submission_id = q.submission_id JOIN submissions s ON s.id = q.submission_id JOIN managed_providers p ON p.submission_id = s.id WHERE BINARY q.model_id = BINARY ? AND s.status = 'approved' AND s.directory_listed = 1 AND p.active = 1 AND ps.enabled = 1 ORDER BY q.id DESC LIMIT 500`).all(model)
+  const query = `SELECT ${quoteFields.replace('q.group_multiplier AS groupMultiplier, ', '')}, ${groupFields}, ps.platform, s.id AS siteId, CONCAT('managed-', p.id) AS providerId, s.name AS siteName, s.website, 1 AS verified, CASE WHEN l.image IS NOT NULL AND l.website = p.website THEN CONCAT('/api/site-logos/', p.id, '?v=', l.digest) ELSE NULL END AS logoUrl FROM site_public_quotes q JOIN site_pricing_settings ps ON ps.submission_id = q.submission_id JOIN submissions s ON s.id = q.submission_id JOIN managed_providers p ON p.submission_id = s.id LEFT JOIN site_logos l ON l.provider_id = p.id ${groupJoin} WHERE BINARY q.model_id = BINARY ? AND s.status = 'approved' AND s.directory_listed = 1 AND p.active = 1 AND ps.enabled = 1 ORDER BY q.id DESC LIMIT 500`
+  const rows = await db.prepare(query).all(model)
   return rows.map(row => ({ ...row, stale: stale(row.syncedAt) }))
 }
 
@@ -131,28 +133,53 @@ export async function handlePublicPricing(c: Context) {
   res.setHeader('cache-control', 'no-store')
   if (!c.user) return send(401, { error: 'Login required' })
   if (req.method !== 'GET' && (!req.headers.origin || req.headers.origin !== `${req.socket instanceof TLSSocket && req.socket.encrypted ? 'https' : 'http'}://${req.headers.host}`)) return send(403, { error: 'Invalid origin' })
-  const match = c.url.pathname.match(/^\/api\/user\/sites\/(\d+)\/pricing(\/sync)?$/)
+  const match = c.url.pathname.match(/^\/api\/user\/sites\/(\d+)\/(pricing|groups)(\/sync)?$/)
   if (!match) return send(404, { error: 'Not found' })
   const id = Number(match[1])
   if (!Number.isSafeInteger(id) || id < 1) return send(400, { error: 'Invalid site ID' })
   try {
     const site = await db.prepare("SELECT s.id, s.website FROM submissions s WHERE s.id = ? AND s.status = 'approved' AND (BINARY s.owner_identity = BINARY ? OR (? IS NOT NULL AND s.user_id = ?))").get(id, ownerIdentity(c.user, c.localUserId), c.localUserId, c.localUserId)
     if (!site) return send(404, { error: 'Approved owned site not found' })
+    if (match[2] === 'groups') {
+      const groupSnapshot = async () => {
+        const stored = await db.get('SELECT groups_json AS groupsJson, detected_at AS detectedAt, source_url AS source FROM site_group_snapshots WHERE submission_id = ? AND BINARY website = BINARY ?', [id, site.website])
+        return { groups: stored ? (typeof stored.groupsJson === 'string' ? JSON.parse(stored.groupsJson) : stored.groupsJson) : [], detectedAt: stored?.detectedAt ?? null, source: stored?.source ?? null }
+      }
+      if (!match[3] && req.method === 'GET') return send(200, await groupSnapshot())
+      if (!match[3] || req.method !== 'POST') return send(405, { error: 'Method not allowed' })
+      const platform = await db.transaction(async connection => {
+        await db.get('SELECT id FROM submissions WHERE id = ? FOR UPDATE', [id], connection)
+        const previous = await db.get('SELECT website, attempted_at AS attemptedAt FROM site_group_fetches WHERE submission_id = ?', [id], connection)
+        if (previous?.website === site.website && previous.attemptedAt && Date.now() - new Date(String(previous.attemptedAt)).getTime() < 300000) throw new SyncError('throttled')
+        await db.run('INSERT INTO site_group_fetches (submission_id, website, attempted_at) VALUES (?, ?, CURRENT_TIMESTAMP(3)) ON DUPLICATE KEY UPDATE website = VALUES(website), attempted_at = VALUES(attempted_at)', [id, site.website], connection)
+        const settings = await db.get('SELECT platform FROM site_pricing_settings WHERE submission_id = ?', [id], connection)
+        return String(settings?.platform ?? 'new-api')
+      })
+      try {
+        if (!['new-api', 'sub2api'].includes(platform)) throw new SyncError('unsupported_platform')
+        const source = publicPricingUrl(String(site.website), platform)
+        const payload = await (c.fetchPricing ?? fetchPublicPricing)(source)
+        await storePublicGroups(db, id, String(site.website), source, parsePublicGroups(payload, platform), new Date())
+        return send(200, await groupSnapshot())
+      } catch {
+        return send(422, { ...await groupSnapshot(), error: '分组同步失败，已保留上次成功数据，请稍后重试。' })
+      }
+    }
     const snapshot = async () => {
       const settings = await db.prepare('SELECT enabled, platform, synced_at AS syncedAt, last_attempt_at AS lastAttemptAt, error_code AS errorCode, unsupported_count AS unsupportedCount FROM site_pricing_settings WHERE submission_id = ?').get(id)
       const rows = await db.prepare(`SELECT ${quoteFields} FROM site_public_quotes q WHERE q.submission_id = ? ORDER BY q.id LIMIT 10000`).all(id)
       const error = settings?.errorCode ? String(settings.errorCode) : null
       return { settings: { enabled: Boolean(settings?.enabled), platform: settings?.platform ?? 'new-api' }, sync: { syncedAt: settings?.syncedAt ?? null, lastAttemptAt: settings?.lastAttemptAt ?? null, error: error ? errors[error] ?? errors.upstream_unavailable : null, errorCode: error, unsupportedCount: Number(settings?.unsupportedCount ?? 0), stale: stale(settings?.syncedAt) }, quotes: rows.map(row => ({ ...row, stale: stale(row.syncedAt) })) }
     }
-    if (!match[2] && req.method === 'GET') return send(200, await snapshot())
-    if (!match[2] && req.method === 'PATCH') {
+    if (!match[3] && req.method === 'GET') return send(200, await snapshot())
+    if (!match[3] && req.method === 'PATCH') {
       let body: Record<string, unknown>
       try { body = await c.readJson(req) } catch { return send(400, { error: 'Invalid request' }) }
       if (typeof body.enabled !== 'boolean' || !['new-api', 'sub2api'].includes(String(body.platform))) return send(400, { error: 'enabled must be boolean; platform must be new-api or sub2api' })
       await db.prepare('INSERT INTO site_pricing_settings (submission_id, enabled, platform) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE enabled = VALUES(enabled), platform = VALUES(platform), revision = revision + 1').run(id, body.enabled, String(body.platform))
       return send(200, await snapshot())
     }
-    if (match[2] && req.method === 'POST') {
+    if (match[3] && req.method === 'POST') {
       const claim = await db.transaction(async connection => {
         const settings = await db.get('SELECT enabled, platform, revision, last_attempt_at AS lastAttemptAt FROM site_pricing_settings WHERE submission_id = ? FOR UPDATE', [id], connection)
         if (!settings?.enabled) throw new SyncError('disabled')
@@ -165,11 +192,12 @@ export async function handlePublicPricing(c: Context) {
         const source = publicPricingUrl(String(site.website), claim.platform)
         const payload = await (c.fetchPricing ?? fetchPublicPricing)(source)
         const parsed = claim.platform === 'new-api' ? parseNewApiPricing(payload) : parseSub2ApiPricing(payload)
+        await storePublicGroups(db, id, String(site.website), source, parsePublicGroups(payload, claim.platform), new Date())
         await db.transaction(async connection => {
           const settings = await db.get('SELECT enabled, platform, revision FROM site_pricing_settings WHERE submission_id = ? FOR UPDATE', [id], connection)
           if (!settings?.enabled || Number(settings.revision) !== claim.revision || settings.platform !== claim.platform) throw new SyncError('changed')
           await db.run('DELETE FROM site_public_quotes WHERE submission_id = ?', [id], connection)
-          for (const q of parsed.quotes) await db.run('INSERT INTO site_public_quotes (submission_id, model_id, group_name, currency, billing_unit, input_price, output_price, source_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', [id, q.modelId, q.groupName, q.currency, q.billingUnit, q.inputPrice, q.outputPrice, source.href], connection)
+          for (const q of parsed.quotes) await db.run('INSERT INTO site_public_quotes (submission_id, model_id, group_name, currency, billing_unit, input_price, output_price, source_url, group_multiplier) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [id, q.modelId, q.groupName, q.currency, q.billingUnit, q.inputPrice, q.outputPrice, source.href, q.groupMultiplier], connection)
           await db.run('UPDATE site_pricing_settings SET synced_at = CURRENT_TIMESTAMP, error_code = NULL, unsupported_count = ? WHERE submission_id = ?', [parsed.unsupportedCount, id], connection)
         })
         return send(200, await snapshot())

@@ -132,3 +132,18 @@ test('keeps media generation distinct from image and video understanding', () =>
   assert.deepEqual(modelCapabilities(price({ capabilityMetadata: JSON.stringify({ type: 'embedding', modalities: { input: ['text'], output: [] } }) })), [])
   assert.deepEqual(modelCapabilities(price({ capabilityMetadata: JSON.stringify({ type: 'audio', modalities: { input: ['text'], output: ['audio'] } }) })).map(item => item.label), ['语音'])
 })
+
+test('manual models take priority without backfilling unknown values or converting USD provenance', () => {
+  const [model] = mergePrices([
+    price({ sourceId: 'official', inputPrice: 10 }),
+    price({ sourceId: 'manual', inputPrice: null, outputPrice: 0, sourceName: 'Manual verified', releaseDate: null }),
+  ])
+  assert.equal(model.inputPrice, null)
+  assert.equal(model.outputPrice, 0)
+  assert.equal(model.releaseDate, null)
+  assert.equal(model.priceSource, 'Manual verified价格')
+  const [media] = mergePrices([price({ sourceId: 'manual', providerId: 'volcengine', modality: 'image', billingUnit: '每张图片', inputPrice: 0.03, sourceName: 'Official USD' })])
+  assert.equal(media.inputPrice, 0.03)
+  assert.equal(media.billingUnit, '每张图片')
+  assert.equal(media.priceSource.includes('人民币'), false)
+})

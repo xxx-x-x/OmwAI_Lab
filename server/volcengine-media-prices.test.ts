@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { mergePrices } from './pricing.ts'
-import { volcengineMediaPrices } from './volcengine-media-prices.ts'
+import { readFileSync } from 'node:fs'
+import { validatePriceImport } from './price-import.ts'
+const volcengineMediaPrices = validatePriceImport(JSON.parse(readFileSync(new URL('../data/curated-model-prices.json', import.meta.url), 'utf8'))).filter(row => row.providerId === 'volcengine')
 
 test('includes all officially listed Seedream and Seedance online rates with explicit units', () => {
   const models = mergePrices(volcengineMediaPrices)

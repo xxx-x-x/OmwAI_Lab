@@ -1,0 +1,16 @@
+.detector-page { max-width: 960px; }
+.detector-page h1 small { font-size: .8rem; font-weight: 500; color: var(--text-secondary, #64748b); }
+.detector-page > .notice { margin: 24px 0; }
+.detector-form, .detector-report { margin: 24px 0; }
+.detector-form fieldset { border: 0; padding: 0; margin: 0; min-width: 0; display: grid; gap: 18px; }
+.detector-form legend { font-size: 1.2rem; font-weight: 600; margin-bottom: 16px; }
+.detector-form label { display: grid; gap: 8px; }
+.detector-form input:not([type=checkbox]), .detector-form select { width: 100%; padding: 11px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface, #fff); color: var(--ink); font: inherit; }
+.detector-form .detector-consent { display: flex; align-items: flex-start; gap: 10px; line-height: 1.6; }
+.detector-consent input { margin-top: 6px; flex-shrink: 0; }
+.detector-form button { justify-self: start; }
+.detector-error { padding: 16px; border: 1px solid #dc2626; border-radius: 8px; color: #dc2626; }
+.detector-report pre { max-height: 560px; overflow: auto; padding: 16px; background: var(--surface, #f1f5f9); border-radius: 8px; font-size: .85rem; }
+.detector-report code { overflow-wrap: anywhere; }
+.detector-report button { margin: 8px 8px 8px 0; }
+.detector-report summary { cursor: pointer; margin-top: 20px; }

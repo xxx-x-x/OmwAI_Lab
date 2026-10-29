@@ -1,27 +1,29 @@
 import { randomBytes, randomInt, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto'
-import { lookup } from 'node:dns/promises'
-import { isIP } from 'node:net'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { createDatabase, initializeDatabase, type DatabaseRow } from './mysql.js'
-import { mergePrices, type PriceRow } from './pricing.js'
-import { volcengineMediaPrices } from './volcengine-media-prices.js'
-import { withOpenaiPrices } from './openai-prices.js'
+import { createDatabase, initializeDatabase } from './mysql.js'
+import { mergePrices } from './pricing.js'
+import { loadPrices } from './price-store.js'
 import { handleSiteGroups } from './site-groups.js'
 import { handlePublicPricing } from './public-pricing.js'
+import { createGroupCache, readGroupSnapshot } from './group-cache.js'
 import { handleSiteManagement } from './site-management.js'
+import { updateAdminProvider } from './admin-providers.js'
+import { createAdminModelPrice, validateManualModel, editAdminModelPrice, listAdminModelPrices, priceIdentity, validatePriceOverride } from './admin-model-prices.js'
+import { analyticsRange, createAnalyticsCollector, getAnalyticsDashboard } from './analytics.js'
 import { createSiteLogoCache, serveSiteLogo } from './site-logo-cache.js'
 import { createEmailService, type EmailConfig } from './email.js'
 import { AuthRedisUnavailableError, CODE_COOLDOWN_MS, createAuthRedis } from './auth-redis.js'
+import { createMfa, MfaError, MFA_RECENT_MS } from './mfa.js'
+import { createDetector } from './detector.js'
 
-const MAX_RESPONSE_BYTES = 5 * 1024 * 1024
-const PROBE_TIMEOUT_MS = 10_000
-const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000
+import { ADMIN_SESSION_TTL_MS, SESSION_TTL_MS, sessionCookie, sessionExpired, validWriteOrigin } from './session-security.js'
 
-type AuthUser = { id: number | string; login: string; name: string | null; avatar_url: string; html_url: string; role: 'user' | 'admin' }
-type Session = { user: AuthUser; expiresAt: number; localUserId: number | null }
+
+import type { AuthUser, Session } from './redis-sessions.js'
 type TurnstileResult = { success: boolean; action?: string; hostname?: string; 'error-codes'?: string[] }
 type SourceModel = Record<string, unknown>
 
+const MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 const LEADERBOARD_URL = 'https://artificialanalysis.ai/leaderboards/models'
 
 async function fetchModelLeaderboard() {
@@ -79,96 +81,17 @@ async function readJson(request: IncomingMessage) {
   return JSON.parse(body || '{}') as Record<string, unknown>
 }
 
-function isPrivateAddress(address: string) {
-  const normalized = address.toLowerCase()
-  if (normalized === '::1' || normalized.startsWith('fe80:') || normalized.startsWith('fc') || normalized.startsWith('fd')) return true
-  if (/^127\./.test(normalized) || /^10\./.test(normalized) || /^192\.168\./.test(normalized) || /^169\.254\./.test(normalized)) return true
-  const match = normalized.match(/^172\.(\d+)\./)
-  return match ? Number(match[1]) >= 16 && Number(match[1]) <= 31 : false
-}
-
-async function probeGroups(siteUrl: string) {
-  const site = new URL(siteUrl)
-  const normalizedHostname = site.hostname.toLowerCase()
-  if (site.protocol !== 'https:' || site.username || site.password || normalizedHostname === 'localhost' || normalizedHostname.endsWith('.local')) {
-    throw new Error('仅支持不含凭据的公网 HTTPS 站点')
-  }
-  const addresses = await lookup(site.hostname, { all: true })
-  if (!addresses.length || addresses.some(({ address }) => isIP(address) === 0 || isPrivateAddress(address))) {
-    throw new Error('站点地址不能指向私有网络')
-  }
-
-  const endpoint = new URL('/api/pricing', site.origin)
-  const response = await fetch(endpoint, {
-    headers: { accept: 'application/json', 'user-agent': 'OmwAI-Lab-Group-Probe/1.0' },
-    redirect: 'error',
-    signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
-  })
-  if (!response.ok) throw new Error(`站点返回 HTTP ${response.status}`)
-  const contentLength = Number(response.headers.get('content-length') ?? 0)
-  if (contentLength > MAX_RESPONSE_BYTES) throw new Error('站点响应过大')
-  const text = await response.text()
-  if (Buffer.byteLength(text) > MAX_RESPONSE_BYTES) throw new Error('站点响应过大')
-  if (!text.trim()) throw new Error('该站点暂无开放 /api/pricing 接口，无法获取分组信息')
-  let payload: Record<string, unknown>
-  try {
-    payload = JSON.parse(text) as Record<string, unknown>
-  } catch {
-    throw new Error('站点的公开计价接口未返回有效 JSON，无法获取分组信息')
-  }
-  if (payload.success !== true || typeof payload.group_ratio !== 'object' || payload.group_ratio === null) {
-    throw new Error('未发现兼容的公开分组接口')
-  }
-
-  const ratios = payload.group_ratio as Record<string, unknown>
-  const descriptions = (payload.usable_group && typeof payload.usable_group === 'object' ? payload.usable_group : {}) as Record<string, unknown>
-  const userGroups = (payload.user_groups && typeof payload.user_groups === 'object' ? payload.user_groups : {}) as Record<string, unknown>
-  const autoGroups = new Set(Array.isArray(payload.auto_groups) ? payload.auto_groups.filter((item): item is string => typeof item === 'string') : [])
-  const models = Array.isArray(payload.data) ? payload.data : []
-  const modelCounts = new Map<string, number>()
-  for (const model of models) {
-    if (!model || typeof model !== 'object') continue
-    const enabled = (model as Record<string, unknown>).enable_groups
-    if (!Array.isArray(enabled)) continue
-    for (const group of new Set(enabled.filter((item): item is string => typeof item === 'string'))) {
-      modelCounts.set(group, (modelCounts.get(group) ?? 0) + 1)
-    }
-  }
-
-  const groups = Object.entries(ratios).flatMap(([name, ratio]) => typeof ratio === 'number' && Number.isFinite(ratio) ? [{
-    name,
-    ratio,
-    type: autoGroups.has(name) ? '自动分组' : userGroups[name] === true ? '用户等级' : '模型分组',
-    description: typeof descriptions[name] === 'string' ? descriptions[name] : '',
-    modelCount: modelCounts.get(name) ?? 0,
-  }] : []).sort((a, b) => a.type.localeCompare(b.type, 'zh-CN') || a.ratio - b.ratio || a.name.localeCompare(b.name, 'zh-CN'))
-
-  return { groups, detectedAt: new Date().toISOString(), source: endpoint.toString() }
-}
-
-const probeMiddleware: Middleware = async (request, response) => {
-    response.setHeader('content-type', 'application/json; charset=utf-8')
-    try {
-      const requestUrl = new URL(request.url ?? '/', 'http://localhost')
-      const site = requestUrl.searchParams.get('site')
-      if (!site) {
-        response.statusCode = 400
-        response.end(JSON.stringify({ error: '缺少站点地址' }))
-        return
-      }
-      response.end(JSON.stringify(await probeGroups(site)))
-    } catch (error) {
-      response.statusCode = 502
-      response.end(JSON.stringify({ error: error instanceof Error ? error.message : '探测失败' }))
-    }
-}
-
-function createAuthMiddleware(clientId: string, clientSecret: string, googleClientId: string, googleClientSecret: string, databaseUrl: string, siteKey: string, emailConfig: EmailConfig, verificationSecret: string, secureCookies: boolean, turnstileSiteKey: string, turnstileSecretKey: string, redisUrl: string, redisPrefix: string, trustProxy: boolean, publicOrigin: string) {
+function createAuthMiddleware(clientId: string, clientSecret: string, googleClientId: string, googleClientSecret: string, databaseUrl: string, siteKey: string, emailConfig: EmailConfig, verificationSecret: string, secureCookies: boolean, turnstileSiteKey: string, turnstileSecretKey: string, redisUrl: string, redisPrefix: string, trustProxy: boolean, publicOrigin: string, mfaEncryptionKey: string) {
   const authStore = createAuthRedis(redisUrl, redisPrefix, verificationSecret)
   let databaseInstance: ReturnType<typeof createDatabase> | undefined
   const database = new Proxy({} as ReturnType<typeof createDatabase>, { get: (_target, property) => Reflect.get(databaseInstance ??= createDatabase(databaseUrl), property) })
   const emailService = createEmailService(emailConfig)
   const siteLogos = createSiteLogoCache(database)
+  const siteGroups = createGroupCache(database)
+  const collectAnalytics = createAnalyticsCollector(database, publicOrigin, trustProxy, async () => {
+    ready ??= initializeDatabase(database).catch(() => { ready = undefined; throw new Error('数据库服务暂不可用') })
+    await ready
+  })
   let ready: Promise<void> | undefined
   const syncModelRankings = async () => {
     const models = await fetchModelLeaderboard()
@@ -183,7 +106,9 @@ function createAuthMiddleware(clientId: string, clientSecret: string, googleClie
     })
     return { count: models.length, syncedAt: syncedAt.toISOString() }
   }
-  const sessions = new Map<string, Session>()
+  const mfa = createMfa(database, mfaEncryptionKey)
+  const mfaChallenges = new Map<string, { userId: number; expiresAt: number }>()
+  const sessions = authStore.sessions
   const oauthStates = new Map<string, number>()
   const verifyTurnstile = async (request: IncomingMessage, token: unknown, expectedAction: string) => {
     if (!turnstileSecretKey) return false
@@ -206,10 +131,20 @@ function createAuthMiddleware(clientId: string, clientSecret: string, googleClie
     }
   }
   const cookieSecurity = secureCookies ? '; Secure' : ''
-  const createSession = (response: ServerResponse, user: AuthUser, localUserId: number | null = null) => {
+  const revokeUserSessions = async (localUserId: number) => {
+    await sessions.revokeUser(localUserId)
+    for (const [token, challenge] of mfaChallenges) if (challenge.userId === localUserId) mfaChallenges.delete(token)
+  }
+  const createSession = async (response: ServerResponse, user: AuthUser, localUserId: number | null = null, mfaVerifiedAt?: number) => {
+    const previousId = parseCookies(response.req).omwai_session
+    if (previousId) await sessions.delete(previousId)
+    const now = Date.now()
     const id = randomBytes(32).toString('hex')
-    sessions.set(id, { user, localUserId, expiresAt: Date.now() + SESSION_TTL_MS })
-    response.setHeader('set-cookie', `omwai_session=${id}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_TTL_MS / 1000}${cookieSecurity}`)
+    const ttl = user.role === 'admin' ? ADMIN_SESSION_TTL_MS : SESSION_TTL_MS
+    const session: Session = { user, localUserId, expiresAt: now + ttl, lastSeenAt: now, mfaVerifiedAt }
+    await sessions.create(id, session)
+    response.setHeader('set-cookie', sessionCookie(id, secureCookies, ttl / 1000))
+    return session
   }
 
   const handle: Middleware = async (request, response, next) => {
@@ -223,12 +158,21 @@ function createAuthMiddleware(clientId: string, clientSecret: string, googleClie
         return json(response, 503, { error: '认证存储服务暂不可用，请稍后再试' })
       }
     }
+    if (url.pathname === '/api/analytics/events') {
+      try {
+        const analyticsId = parseCookies(request).omwai_session
+        const analyticsSession = analyticsId ? await sessions.get(analyticsId, false) : undefined
+        if (request.method === 'POST' && validWriteOrigin(request, publicOrigin) && analyticsSession?.user.role === 'admin' && !sessionExpired(analyticsSession)) return json(response, 202, { ok: true })
+      } catch (error) { if (error instanceof AuthRedisUnavailableError) throw error; return json(response, 400, { error: 'Invalid cookies' }) }
+      return collectAnalytics(request, response, json)
+    }
     if (!url.pathname.startsWith('/api/auth/') && !url.pathname.startsWith('/api/submissions') && !url.pathname.startsWith('/api/admin/') && !url.pathname.startsWith('/api/user/') && !url.pathname.startsWith('/api/model-rankings') && !url.pathname.startsWith('/api/model-prices') && url.pathname !== '/api/site-comparison' && url.pathname !== '/api/directory' && !/^\/api\/site-logos\/\d+$/.test(url.pathname)) return next()
     if (!['/api/auth/me', '/api/auth/turnstile-config', '/api/auth/github', '/api/auth/github/callback', '/api/auth/google', '/api/auth/google/callback', '/api/auth/logout'].includes(url.pathname)) {
       try {
         ready ??= initializeDatabase(database).catch(() => { ready = undefined; throw new Error('数据库服务暂不可用') })
         await ready
         siteLogos.start()
+        siteGroups.start()
       } catch { return json(response, 503, { error: '数据库服务暂不可用' }) }
     }
 
@@ -242,18 +186,97 @@ function createAuthMiddleware(clientId: string, clientSecret: string, googleClie
       return json(response, 200, { models, latest })
     }
     if (url.pathname === '/api/model-prices' && request.method === 'GET') {
-      const prices = await database.prepare("SELECT provider_id AS providerId, model_id AS modelId, name, provider_name AS providerName, provider_icon_url AS providerIconUrl, release_date AS releaseDate, capability_metadata AS capabilityMetadata, reasoning, open_weights AS openWeights, input_price AS inputPrice, output_price AS outputPrice, cached_input_price AS cacheReadPrice, source_url AS sourceUrl FROM model_prices WHERE source_id = 'official'").all<DatabaseRow & PriceRow>()
-      const models = mergePrices([...withOpenaiPrices(prices), ...volcengineMediaPrices])
+      const models = mergePrices(await loadPrices(database))
       const latest = await database.prepare('SELECT model_count AS modelCount, provider_count AS providerCount, synced_at AS syncedAt, source_url AS sourceUrl FROM model_price_syncs ORDER BY id DESC LIMIT 1').get() ?? null
       return json(response, 200, { models, latest })
     }
 
+    if (url.pathname.startsWith('/api/auth/') || url.pathname.startsWith('/api/admin/') || url.pathname.startsWith('/api/user/')) response.setHeader('cache-control', 'no-store')
     const sessionId = parseCookies(request).omwai_session
-    const session = sessionId ? sessions.get(sessionId) : undefined
-    const user = session && session.expiresAt > Date.now() ? session.user : null
-    if (sessionId && !user) sessions.delete(sessionId)
+    if (url.pathname === '/api/auth/logout' && request.method === 'POST') {
+      if (sessionId) await sessions.delete(sessionId)
+      response.setHeader('set-cookie', sessionCookie('', secureCookies, 0))
+      response.setHeader('cache-control', 'no-store')
+      return json(response, 200, { ok: true })
+    }
+    const session = sessionId ? await sessions.get(sessionId) : undefined
+    let user = session && !sessionExpired(session) ? session.user : null
+    if (user && session?.localUserId != null) {
+      try {
+        ready ??= initializeDatabase(database).catch(() => { ready = undefined; throw new Error('数据库服务暂不可用') })
+        await ready
+        const account = await database.prepare('SELECT id, username, role FROM users WHERE id = ?').get(session.localUserId)
+        if (!account || account.role !== user.role) {
+          await revokeUserSessions(session.localUserId)
+          user = null
+        } else {
+          user = localUser(account)
+          session.user = user
+        }
+      } catch (error) {
+        if (error instanceof AuthRedisUnavailableError) throw error
+        return json(response, 503, { error: '数据库服务暂不可用' })
+      }
+    }
+    if (sessionId && !user) {
+      await sessions.delete(sessionId)
+      response.setHeader('set-cookie', sessionCookie('', secureCookies, 0))
+    }
+    if (user && session) session.lastSeenAt = Date.now()
+    if (url.pathname.startsWith('/api/auth/') || url.pathname.startsWith('/api/admin/') || url.pathname.startsWith('/api/user/')) response.setHeader('cache-control', 'no-store')
 
-    if (/^\/api\/user\/sites\/\d+\/pricing(?:\/sync)?$/.test(url.pathname)) {
+    if (url.pathname.startsWith('/api/auth/mfa/')) {
+      response.setHeader('cache-control', 'no-store')
+      try {
+        if (url.pathname === '/api/auth/mfa/challenge' && request.method === 'POST') {
+          const body = await readJson(request)
+          const token = String(body.challenge ?? '')
+          const challenge = mfaChallenges.get(token)
+          if (!challenge || challenge.expiresAt <= Date.now()) { mfaChallenges.delete(token); return json(response, 401, { error: '登录验证已过期，请重新登录' }) }
+          const row = await database.get("SELECT id, username, role FROM users WHERE id = ? AND role = 'admin'", [challenge.userId])
+          if (!row || !(await mfa.status(challenge.userId)).enabled) { mfaChallenges.delete(token); return json(response, 401, { error: '登录验证已失效' }) }
+          await mfa.verify(challenge.userId, String(body.code ?? '').trim())
+          if (!mfaChallenges.delete(token)) return json(response, 401, { error: '登录验证已使用' })
+          const signedInUser = localUser(row)
+          await createSession(response, signedInUser, challenge.userId, Date.now())
+          return json(response, 200, { user: signedInUser })
+        }
+        if (!user || !session?.localUserId || user.role !== 'admin') return json(response, 403, { error: '仅限本地管理员账户' })
+        const id = session.localUserId
+        if (url.pathname === '/api/auth/mfa/status' && request.method === 'GET') return json(response, 200, { ...await mfa.status(id), recent: Boolean(session.mfaVerifiedAt && Date.now() - session.mfaVerifiedAt < MFA_RECENT_MS) })
+        if (request.method !== 'POST') return json(response, 405, { error: '不支持的请求方式' })
+        const body = await readJson(request)
+        if (url.pathname === '/api/auth/mfa/setup') {
+          if (!await authStore.allowRequest('mfa-setup:' + id)) return json(response, 429, { error: '请求过于频繁，请稍后重试' })
+          const account = await database.get('SELECT password_hash FROM users WHERE id = ?', [id])
+          if (!account || !passwordMatches(String(body.password ?? ''), String(account.password_hash))) return json(response, 401, { error: '绑定前请验证当前密码' })
+          return json(response, 200, await mfa.begin(id, user.login))
+        }
+        if (url.pathname === '/api/auth/mfa/confirm' || url.pathname === '/api/auth/mfa/verify') {
+          const result = await mfa.verify(id, String(body.code ?? '').trim(), url.pathname.endsWith('/confirm'))
+          await revokeUserSessions(id)
+          await createSession(response, user, id, Date.now())
+          return json(response, 200, { ok: true, recoveryCodes: result.codes })
+        }
+        if (!session.mfaVerifiedAt || Date.now() - session.mfaVerifiedAt >= MFA_RECENT_MS) return json(response, 403, { code: 'MFA_REQUIRED', error: '请先重新验证 MFA' })
+        if (url.pathname === '/api/auth/mfa/recovery-codes') return json(response, 200, { recoveryCodes: await mfa.regenerate(id) })
+        if (url.pathname === '/api/auth/mfa/disable') {
+          await mfa.disable(id)
+          await revokeUserSessions(id)
+          await createSession(response, user, id)
+          return json(response, 200, { ok: true })
+        }
+        return json(response, 404, { error: '接口不存在' })
+      } catch (error) {
+        return json(response, error instanceof MfaError ? error.status : 503, { error: error instanceof MfaError ? error.message : 'MFA 服务暂不可用，请检查独立加密密钥及数据库配置' })
+      }
+    }
+    if (url.pathname.startsWith('/api/admin/') && user?.role === 'admin' && session?.localUserId) {
+      const writes = !['GET', 'HEAD', 'OPTIONS'].includes(request.method ?? 'GET')
+      if ((await mfa.status(session.localUserId)).enabled && (!session.mfaVerifiedAt || (writes && Date.now() - session.mfaVerifiedAt >= MFA_RECENT_MS))) return json(response, 403, { code: 'MFA_REQUIRED', error: '管理员操作需要 MFA 验证，写操作要求最近 5 分钟内验证' })
+    }
+
+    if (/^\/api\/user\/sites\/\d+\/(?:pricing|groups)(?:\/sync)?$/.test(url.pathname)) {
       return handlePublicPricing({ database, request, response, url, user, localUserId: user ? session?.localUserId ?? null : null, readJson, json })
     }
 
@@ -308,7 +331,7 @@ function createAuthMiddleware(clientId: string, clientSecret: string, googleClie
         if (!await authStore.consumeCode(email, 'register', code)) return json(response, 400, { error: '邮箱验证码错误或已失效' })
         const result = await database.run('INSERT INTO users (username, email, password_hash, email_verified_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)', [username, email, passwordHash(password)])
         const registeredUser = localUser({ id: result.insertId, username, role: 'user' })
-        createSession(response, registeredUser, Number(result.insertId))
+        await createSession(response, registeredUser, Number(result.insertId))
         return json(response, 201, { user: registeredUser })
       } catch (error) {
         if (error instanceof AuthRedisUnavailableError) return json(response, 503, { error: error.message })
@@ -326,9 +349,18 @@ function createAuthMiddleware(clientId: string, clientSecret: string, googleClie
         const row = await database.prepare('SELECT id, username, password_hash, role FROM users WHERE username = ? OR email = ?').get(account, account) as Record<string, unknown> | undefined
         if (!row || !passwordMatches(password, String(row.password_hash))) return json(response, 401, { error: '账号或密码错误' })
         const signedInUser = localUser(row)
-        createSession(response, signedInUser, Number(signedInUser.id))
+        if (signedInUser.role === 'admin' && (await mfa.status(Number(signedInUser.id))).enabled) {
+          for (const [token, pending] of mfaChallenges) if (pending.expiresAt <= Date.now()) mfaChallenges.delete(token)
+          if (mfaChallenges.size >= 10000) return json(response, 503, { error: '登录验证繁忙，请稍后重试' })
+          if (sessionId) await sessions.delete(sessionId)
+          const challenge = randomBytes(32).toString('hex')
+          mfaChallenges.set(challenge, { userId: Number(signedInUser.id), expiresAt: Date.now() + 5 * 60_000 })
+          return json(response, 200, { mfaRequired: true, challenge })
+        }
+        await createSession(response, signedInUser, Number(signedInUser.id))
         return json(response, 200, { user: signedInUser })
-      } catch {
+      } catch (error) {
+        if (error instanceof AuthRedisUnavailableError) return json(response, 503, { error: error.message })
         return json(response, 400, { error: '登录请求无效' })
       }
     }
@@ -345,6 +377,8 @@ function createAuthMiddleware(clientId: string, clientSecret: string, googleClie
         const account = await database.prepare('SELECT id FROM users WHERE email = ?').get(email)
         if (!account || !await authStore.consumeCode(email, 'reset-password', code)) return json(response, 400, { error: '邮箱验证码错误或已失效' })
         await database.run('UPDATE users SET password_hash = ? WHERE email = ?', [passwordHash(password), email])
+        await revokeUserSessions(Number(account.id))
+        response.setHeader('set-cookie', sessionCookie('', secureCookies, 0))
         return json(response, 200, { ok: true })
       } catch (error) {
         if (error instanceof AuthRedisUnavailableError) return json(response, 503, { error: error.message })
@@ -378,11 +412,12 @@ function createAuthMiddleware(clientId: string, clientSecret: string, googleClie
         const userResponse = await fetch('https://api.github.com/user', { headers: { authorization: `Bearer ${tokenPayload.access_token}`, accept: 'application/vnd.github+json', 'user-agent': 'OmwAI-Lab' } })
         if (!userResponse.ok) throw new Error('无法获取 GitHub 用户信息')
         const githubProfile = await userResponse.json() as Omit<AuthUser, 'role'>
-        createSession(response, { ...githubProfile, role: 'user' })
+        await createSession(response, { ...githubProfile, role: 'user' })
         response.statusCode = 302
         response.setHeader('location', '/submit')
         return response.end()
       } catch (error) {
+        if (error instanceof AuthRedisUnavailableError) return json(response, 503, { error: error.message })
         return json(response, 502, { error: error instanceof Error ? error.message : 'GitHub 登录失败' })
       }
     }
@@ -412,18 +447,14 @@ function createAuthMiddleware(clientId: string, clientSecret: string, googleClie
         const profileResponse = await fetch('https://openidconnect.googleapis.com/v1/userinfo', { headers: { authorization: `Bearer ${token.access_token}` } })
         const profile = await profileResponse.json() as { sub: string; name?: string; email?: string; picture?: string }
         if (!profileResponse.ok || !profile.sub) throw new Error('无法获取 Google 用户信息')
-        createSession(response, { id: profile.sub, login: profile.email ?? profile.sub, name: profile.name ?? null, avatar_url: profile.picture ?? '', html_url: '', role: 'user' })
+        await createSession(response, { id: profile.sub, login: profile.email ?? profile.sub, name: profile.name ?? null, avatar_url: profile.picture ?? '', html_url: '', role: 'user' })
         response.statusCode = 302
         response.setHeader('location', '/submit')
         return response.end()
       } catch (error) {
+        if (error instanceof AuthRedisUnavailableError) return json(response, 503, { error: error.message })
         return json(response, 502, { error: error instanceof Error ? error.message : 'Google 登录失败' })
       }
-    }
-    if (url.pathname === '/api/auth/logout' && request.method === 'POST') {
-      if (sessionId) sessions.delete(sessionId)
-      response.setHeader('set-cookie', 'omwai_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0')
-      return json(response, 200, { ok: true })
     }
     if (url.pathname === '/api/directory' || url.pathname === '/api/submissions' || url.pathname === '/api/user/sites' || /^\/api\/user\/sites\/\d+\/(listing|invoice|billing|revision|logo(?:\/(preview|refetch|image))?)$/.test(url.pathname)) {
       return handleSiteManagement({ database, request, response, url, user, localUserId: user ? session?.localUserId ?? null : null, key: siteKey, readJson, json })
@@ -435,6 +466,27 @@ function createAuthMiddleware(clientId: string, clientSecret: string, googleClie
       if (!adminAccount) return json(response, 403, { error: '管理员身份已失效，请重新登录' })
       const log = async (action: string, targetType: string, targetId: number | null, details = '') => await database.prepare('INSERT INTO audit_logs (admin_id, action, target_type, target_id, details) VALUES (?, ?, ?, ?, ?)').run(adminAccount.id, action, targetType, targetId, details)
 
+      if (url.pathname === '/api/admin/model-prices') {
+        if (request.method === 'GET') {
+          try { return json(response, 200, await listAdminModelPrices(database, url.searchParams)) }
+          catch (error) { return json(response, error instanceof Error && error.message === '搜索或分页参数无效' ? 400 : 503, { error: error instanceof Error && error.message === '搜索或分页参数无效' ? error.message : '模型价格列表暂不可用' }) }
+        }
+        if (request.method === 'POST') {
+          const body = await readJson(request)
+          try { validateManualModel(body) }
+          catch (error) { return json(response, 400, { error: error instanceof Error ? error.message : '模型资料无效' }) }
+          const result = await createAdminModelPrice(database, body, adminAccount.id)
+          return json(response, result.status, result)
+        }
+        if (request.method === 'PUT' || request.method === 'DELETE') {
+          const body = await readJson(request)
+          try { priceIdentity(body); if (request.method === 'PUT') validatePriceOverride(body) }
+          catch (error) { return json(response, 400, { error: error instanceof Error ? error.message : '模型资料无效' }) }
+          const result = await editAdminModelPrice(database, body, adminAccount.id, request.method === 'DELETE')
+          return json(response, result.status, result)
+        }
+        return json(response, 405, { error: '不支持的请求方式' })
+      }
       if (url.pathname === '/api/admin/model-rankings/sync' && request.method === 'POST') {
         try {
           const result = await syncModelRankings()
@@ -445,13 +497,16 @@ function createAuthMiddleware(clientId: string, clientSecret: string, googleClie
         }
       }
       if (url.pathname === '/api/admin/dashboard' && request.method === 'GET') {
-        const counts = await database.prepare("SELECT (SELECT COUNT(*) FROM submissions WHERE status = 'pending') AS pending, (SELECT COUNT(*) FROM managed_providers WHERE active = 1) AS providers, (SELECT COUNT(*) FROM users) AS users, (SELECT COUNT(*) FROM audit_logs) AS logs").get()
-        return json(response, 200, { counts })
+        const range = url.searchParams.get('range')
+        try { analyticsRange(range) } catch { return json(response, 400, { error: 'range must be today, yesterday, 7d or 30d' }) }
+        response.setHeader('cache-control', 'no-store')
+        try { return json(response, 200, await getAnalyticsDashboard(database, range)) }
+        catch { return json(response, 503, { error: '统计数据暂不可用' }) }
       }
       if (/^\/api\/admin\/providers\/\d+\/logo(?:\/(preview|refetch|image))?$/.test(url.pathname) || url.pathname === '/api/admin/submissions' || /^\/api\/admin\/submissions\/\d+$/.test(url.pathname) || /^\/api\/admin\/site-revisions(?:\/\d+)?$/.test(url.pathname)) {
         return handleSiteManagement({ database, request, response, url, user, localUserId: session?.localUserId ?? null, adminId: adminAccount.id, key: siteKey, readJson, json, onApproved: siteLogos.schedule })
       }
-      if (url.pathname === '/api/admin/providers' && request.method === 'GET') return json(response, 200, { providers: await database.prepare('SELECT p.*, s.submitter_login, s.status AS submission_status FROM managed_providers p LEFT JOIN submissions s ON s.id = p.submission_id ORDER BY p.created_at DESC').all() })
+      if (url.pathname === '/api/admin/providers' && request.method === 'GET') return json(response, 200, { providers: await database.prepare('SELECT p.*, s.submitter_login, s.status AS submission_status, s.directory_listed, s.description, DATE_FORMAT(s.founded_at, \'%Y-%m-%d\') AS foundedAt, s.invoice_supported AS invoice, s.billing_type AS billingType, s.billing_details AS billingDetails, EXISTS(SELECT 1 FROM site_revisions r WHERE r.submission_id = s.id AND r.status = \'pending\') AS pendingRevision FROM managed_providers p LEFT JOIN submissions s ON s.id = p.submission_id ORDER BY p.created_at DESC').all() })
       if (url.pathname === '/api/admin/providers' && request.method === 'POST') {
         const body = await readJson(request)
         if (!body.name || !body.website || !body.models || !body.pricing) return json(response, 400, { error: '请完整填写站点信息' })
@@ -462,11 +517,14 @@ function createAuthMiddleware(clientId: string, clientSecret: string, googleClie
       const providerMatch = url.pathname.match(/^\/api\/admin\/providers\/(\d+)$/)
       if (providerMatch && request.method === 'PATCH') {
         const body = await readJson(request); const id = Number(providerMatch[1])
-        const existing = await database.prepare('SELECT * FROM managed_providers WHERE id = ?').get(id) as Record<string, unknown> | undefined
-        if (!existing) return json(response, 404, { error: '站点不存在' })
-        await database.prepare('UPDATE managed_providers SET name = ?, website = ?, models = ?, pricing = ?, notes = ?, active = ? WHERE id = ?').run(String(body.name ?? existing.name).trim(), String(body.website ?? existing.website).trim(), String(body.models ?? existing.models).trim(), String(body.pricing ?? existing.pricing).trim(), String(body.notes ?? existing.notes).trim(), body.active === undefined ? Number(existing.active) : body.active ? 1 : 0, id)
-        await log('provider.update', 'provider', id)
-        return json(response, 200, { ok: true })
+        try {
+          const result = await updateAdminProvider(database, id, body, adminAccount.id)
+          if (result.status === 200) siteLogos.schedule()
+          return json(response, result.status, result.error ? { error: result.error } : { ok: true })
+        } catch (error) {
+          if ((error as { code?: string }).code === 'ER_DUP_ENTRY') return json(response, 409, { error: '该站点网址已存在，请检查后重试' })
+          throw error
+        }
       }
       if (providerMatch && request.method === 'DELETE') {
         const id = Number(providerMatch[1]); await database.prepare('DELETE FROM managed_providers WHERE id = ?').run(id); await log('provider.delete', 'provider', id)
@@ -483,7 +541,9 @@ function createAuthMiddleware(clientId: string, clientSecret: string, googleClie
           const adminCount = await database.prepare("SELECT COUNT(*) AS count FROM users WHERE role = 'admin'").get() as { count: number }
           if (adminCount.count <= 1) return json(response, 409, { error: '不能移除唯一管理员的权限' })
         }
-        await database.prepare('UPDATE users SET role = ? WHERE id = ?').run(role, id); await log('user.role', 'user', id, role)
+        await database.prepare('UPDATE users SET role = ? WHERE id = ?').run(role, id)
+        if (target.role !== role) await revokeUserSessions(id)
+        await log('user.role', 'user', id, role)
         return json(response, 200, { ok: true })
       }
       if (url.pathname === '/api/admin/audit-logs' && request.method === 'GET') return json(response, 200, { logs: await database.prepare('SELECT audit_logs.*, users.username AS admin_name FROM audit_logs JOIN users ON users.id = audit_logs.admin_id ORDER BY audit_logs.created_at DESC LIMIT 200').all() })
@@ -491,20 +551,38 @@ function createAuthMiddleware(clientId: string, clientSecret: string, googleClie
     return json(response, 404, { error: '接口不存在' })
   }
 
-  return { handle, close: async () => { authStore.close(); emailService.close(); await siteLogos.close(); await databaseInstance?.pool.end() } }
+  const probe: Middleware = async (request, response) => {
+    response.setHeader('cache-control', 'no-store')
+    if (request.method !== 'GET') return json(response, 405, { error: '仅支持读取已保存的分组数据' })
+    const site = new URL(request.url ?? '/', 'http://localhost').searchParams.get('site')
+    if (!site) return json(response, 400, { error: '缺少站点地址' })
+    try {
+      ready ??= initializeDatabase(database).catch(() => { ready = undefined; throw new Error('数据库服务暂不可用') })
+      await ready
+      const result = await readGroupSnapshot(database, site)
+      return result ? json(response, 200, result) : json(response, 404, { error: '站点未公开收录' })
+    } catch {
+      return json(response, 503, { error: '分组数据暂时无法读取，请稍后重试' })
+    }
+  }
+  return { handle, probe, close: async () => { authStore.close(); emailService.close(); await siteLogos.close(); await siteGroups.close(); await databaseInstance?.pool.end() } }
 }
 
 export type Middleware = (request: IncomingMessage, response: ServerResponse, next: () => void) => unknown | Promise<unknown>
 
 export function createBackend(env: Record<string, string | undefined>) {
-  const auth = createAuthMiddleware(env.GITHUB_CLIENT_ID || '', env.GITHUB_CLIENT_SECRET || '', env.GOOGLE_CLIENT_ID || '', env.GOOGLE_CLIENT_SECRET || '', env.DATABASE_URL || '', env.SITE_CREDENTIAL_ENCRYPTION_KEY || '', { host: env.SMTP_HOST || '', port: Number(env.SMTP_PORT || 587), secure: env.SMTP_SECURE === 'true', user: env.SMTP_USER || '', password: env.SMTP_PASSWORD || '', from: env.SMTP_FROM || '' }, env.EMAIL_VERIFICATION_SECRET || '', env.COOKIE_SECURE === 'true', env.TURNSTILE_SITE_KEY || '', env.TURNSTILE_SECRET_KEY || '', env.REDIS_URL || '', env.REDIS_KEY_PREFIX || 'omwai:auth:', env.TRUST_PROXY === 'true', env.PUBLIC_ORIGIN || '')
+  const detector = createDetector(env)
+  const auth = createAuthMiddleware(env.GITHUB_CLIENT_ID || '', env.GITHUB_CLIENT_SECRET || '', env.GOOGLE_CLIENT_ID || '', env.GOOGLE_CLIENT_SECRET || '', env.DATABASE_URL || '', env.SITE_CREDENTIAL_ENCRYPTION_KEY || '', { host: env.SMTP_HOST || '', port: Number(env.SMTP_PORT || 587), secure: env.SMTP_SECURE === 'true', user: env.SMTP_USER || '', password: env.SMTP_PASSWORD || '', from: env.SMTP_FROM || '' }, env.EMAIL_VERIFICATION_SECRET || '', env.COOKIE_SECURE === 'true' || env.NODE_ENV === 'production' || env.PUBLIC_ORIGIN?.startsWith('https://') === true, env.TURNSTILE_SITE_KEY || '', env.TURNSTILE_SECRET_KEY || '', env.REDIS_URL || '', env.REDIS_KEY_PREFIX || 'omwai:auth:', env.TRUST_PROXY === 'true', env.PUBLIC_ORIGIN || '', env.MFA_ENCRYPTION_KEY || '')
   const handle: Middleware = async (request, response, next) => {
     try {
       const path = new URL(request.url || '/', 'http://localhost').pathname
+      if (path.startsWith('/api/') && !validWriteOrigin(request, env.PUBLIC_ORIGIN || '')) return json(response, 403, { error: '请求来源校验失败，请从本站页面操作', code: 'CSRF_ORIGIN_REJECTED' })
+      if (path.startsWith('/api/detector/')) return await detector(request, response)
       if (path === '/api/health' && (request.method === 'GET' || request.method === 'HEAD')) return json(response, 200, { status: 'ok' })
-      if (path === '/api/probe/groups' || path.startsWith('/api/probe/groups/')) return await probeMiddleware(request, response, next)
+      if (path === '/api/probe/groups' || path.startsWith('/api/probe/groups/')) return await auth.probe(request, response, next)
       await auth.handle(request, response, next)
-    } catch {
+    } catch (error) {
+      if (error instanceof AuthRedisUnavailableError && !response.headersSent) return json(response, 503, { error: error.message })
       if (!response.headersSent) json(response, 500, { error: '服务暂不可用，请稍后重试' })
       else response.destroy()
     }

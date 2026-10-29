@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { openaiPrices, withOpenaiPrices } from './openai-prices.ts'
+import { readFileSync } from 'node:fs'
+import { validatePriceImport } from './price-import.ts'
+const openaiPrices = validatePriceImport(JSON.parse(readFileSync(new URL('../data/curated-model-prices.json', import.meta.url), 'utf8'))).filter(row => row.providerId === 'openai')
 import { mergePrices } from './pricing.ts'
 
 test('includes verified GPT-6.1 Terra standard pricing and capabilities without upstream data', () => {
-  const [model] = mergePrices(withOpenaiPrices([]))
+  const [model] = mergePrices(openaiPrices)
   assert.equal(model.modelId, 'gpt-6.1-terra')
   assert.equal(model.name, 'GPT-6.1 Terra')
   assert.equal(model.family, 'OpenAI')
@@ -19,12 +21,3 @@ test('includes verified GPT-6.1 Terra standard pricing and capabilities without 
   assert.match(model.pricingDetails, /272K/)
 })
 
-test('overrides upstream Terra exactly once while preserving other models', () => {
-  const terra = openaiPrices[0]
-  const other = { ...terra, modelId: 'gpt-other', name: 'Other', inputPrice: 2 }
-  const rows = withOpenaiPrices([{ ...terra, inputPrice: null, outputPrice: null }, other])
-  assert.equal(rows.length, 2)
-  assert.equal(rows.find(row => row.modelId === terra.modelId)?.inputPrice, 1)
-  assert.equal(rows.find(row => row.modelId === other.modelId), other)
-  assert.deepEqual(withOpenaiPrices(rows), rows)
-})

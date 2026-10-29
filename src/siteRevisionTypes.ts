@@ -7,6 +7,7 @@ export type ManagedSite = {
   id: number; name: string; website: string; models: string; pricing: string; notes: string; status: string; review_note: string
   foundedAt: string | null; description: string; directoryListed: boolean | number; active: boolean | number | null
   billingType: string | null; billingDetails: string | null; invoice: boolean | null
+  listingEnableRemaining?: number; listingQuotaDay?: string
   logoUrl?: string; pendingRevision?: SiteRevision | null; latestRevision?: SiteRevision | null
 }
 export const revisionFieldLabels: Array<[keyof SiteProposal, string]> = [

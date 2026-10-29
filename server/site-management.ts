@@ -3,6 +3,11 @@ import type { Database } from './mysql.js'
 import { handleLogoSettings } from './site-logo-settings.ts'
 import { handleSiteRevision, ownerRevisions, revisionView } from './site-revisions.ts'
 
+export const listingDay = (now = new Date()) => new Date(now.getTime() + 8 * 3600000).toISOString().slice(0, 10)
+export function listingRemaining(site: Record<string, unknown>, day = listingDay()) {
+  return Math.max(0, 2 - (site.listingEnableDay === day ? Number(site.listingEnableCount ?? 0) : 0))
+}
+
 export type SiteOwner = { id: string | number; login: string; html_url: string }
 export function ownerIdentity(user: SiteOwner, localUserId: number | null) {
   return localUserId !== null ? `local:${localUserId}` : `${user.html_url ? 'github' : 'google'}:${user.id}`
@@ -62,12 +67,12 @@ export async function handleSiteManagement(c: Context) {
       return send(201, { ok: true, id: Number(result.insertId) })
     }
     if (url.pathname === '/api/user/sites' && req.method === 'GET') {
-      const rows = await db.prepare(`SELECT ${fields}, p.active FROM submissions s LEFT JOIN managed_providers p ON p.submission_id = s.id WHERE ${ownership} ORDER BY s.created_at DESC`).all(identity, localUserId, localUserId)
+      const rows = await db.prepare(`SELECT ${fields}, p.active, DATE_FORMAT(s.listing_enable_day, '%Y-%m-%d') AS listingEnableDay, s.listing_enable_count AS listingEnableCount FROM submissions s LEFT JOIN managed_providers p ON p.submission_id = s.id WHERE ${ownership} ORDER BY s.created_at DESC`).all(identity, localUserId, localUserId)
       const revisions = await ownerRevisions(db, identity, localUserId)
       const sites = rows.map((row): Record<string, unknown> => {
         const history = revisions.filter(r => Number(r.submission_id) === Number(row.id))
         const pending = history.find(r => r.status === 'pending')
-        return { ...flags(row), pendingRevision: pending ? revisionView(pending) : null, latestRevision: history[0] ? revisionView(history[0]) : null }
+        return { ...flags(row), listingEnableRemaining: listingRemaining(row), listingQuotaDay: listingDay(), pendingRevision: pending ? revisionView(pending) : null, latestRevision: history[0] ? revisionView(history[0]) : null }
       })
       return send(200, { sites, stats: { total: sites.length, pending: sites.filter(s => s.status === 'pending').length, approved: sites.filter(s => s.status === 'approved').length } })
     }
@@ -89,13 +94,18 @@ export async function handleSiteManagement(c: Context) {
       let body: Record<string, unknown>
       try { body = await c.readJson(req) } catch { return send(400, { error: '请求格式无效' }) }
       if (typeof body.listed !== 'boolean') return send(400, { error: 'listed 必须为布尔值' })
-      const owned = await db.transaction(async connection => {
-        const site = await db.get(`SELECT s.id FROM submissions s WHERE s.id = ? AND s.status = 'approved' AND ${ownership} FOR UPDATE`, [id, identity, localUserId, localUserId], connection)
-        if (!site) return false
+      if (body.confirmed !== true) return send(400, { error: '请先确认变更公开展示设置', code: 'LISTING_CONFIRMATION_REQUIRED' })
+      const result = await db.transaction(async connection => {
+        const site = await db.get(`SELECT s.id, s.directory_listed AS directoryListed, DATE_FORMAT(s.listing_enable_day, '%Y-%m-%d') AS listingEnableDay, s.listing_enable_count AS listingEnableCount FROM submissions s WHERE s.id = ? AND s.status = 'approved' AND ${ownership} FOR UPDATE`, [id, identity, localUserId, localUserId], connection)
+        if (!site) return { status: 404, error: '已审核的自有站点不存在' }
+        const day = listingDay(), remaining = listingRemaining(site, day)
+        if (Boolean(site.directoryListed) === body.listed) return { status: 200, remaining, day }
+        if (body.listed && remaining === 0) return { status: 429, error: '该站点今日开启次数已用完，请于北京时间明日 00:00 后重试', code: 'LISTING_DAILY_LIMIT', remaining, day }
+        if (body.listed) await db.run('UPDATE submissions SET listing_enable_day = ?, listing_enable_count = ? WHERE id = ?', [day, 3 - remaining, id], connection)
         await db.run('UPDATE submissions SET directory_listed = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [body.listed as boolean, id], connection)
-        return true
+        return { status: 200, remaining: body.listed ? remaining - 1 : remaining, day }
       })
-      return owned ? send(200, { ok: true, directoryListed: body.listed }) : send(404, { error: '已审核的自有站点不存在' })
+      return send(result.status, { ...(result.error ? { error: result.error, code: result.code } : { ok: true, directoryListed: body.listed }), listingEnableRemaining: result.remaining, listingQuotaDay: result.day })
     }
     if (c.adminId) {
       if (url.pathname === '/api/admin/submissions' && req.method === 'GET') return send(200, { submissions: (await db.prepare(`SELECT ${fields}, DATE_FORMAT(s.founded_at, '%Y-%m-%d') AS founded_at, s.probe_notes FROM submissions s ORDER BY s.created_at DESC`).all()).map(flags) })

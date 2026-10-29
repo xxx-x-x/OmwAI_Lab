@@ -3,6 +3,7 @@ import { Link, NavLink, Route, Routes } from 'react-router-dom'
 import { pricingFamilies, pricingFamilyLabel } from './pricingFamilies'
 import { ModelBrandIcon } from './ModelBrandIcon'
 import MySites from './MySites'
+import SitePricingPage from './SitePricingPage'
 import { ArrowRight, CheckCircle2, FileCheck2, Globe2, ServerCog, ScanSearch, Activity, Clock3 } from 'lucide-react'
 
 const billingTypes = ['按量计费', '按次计费', '包月订阅', '混合计费', '其他']
@@ -71,6 +72,6 @@ export default function SiteManagement() {
       <div className="site-management-brand"><ServerCog size={24} /><div><h1>站点管理</h1><span>SITE MANAGEMENT</span></div></div>
       <nav aria-label="站点管理"><NavLink end to="/site-management"><FileCheck2 size={18} />站点收录</NavLink><NavLink to="/site-management/sites"><Globe2 size={18} />我的站点</NavLink><NavLink to="/site-management/model-test"><ScanSearch size={18} /><span>模型真伪测试<small>暂未开放</small></span></NavLink><NavLink to="/site-management/latency-test"><Activity size={18} /><span>延迟与可用性测试<small>暂未开放</small></span></NavLink></nav>
     </aside>
-    <div className="site-management-content"><Routes><Route index element={<SiteSubmission />} /><Route path="sites" element={<MySites />} /><Route path="model-test" element={<TestPlaceholder type="model" />} /><Route path="latency-test" element={<TestPlaceholder type="latency" />} /><Route path="*" element={<p>页面不存在，请通过左侧菜单访问。</p>} /></Routes></div>
+    <div className="site-management-content"><Routes><Route index element={<SiteSubmission />} /><Route path="sites" element={<MySites />} /><Route path="sites/:siteId/pricing" element={<SitePricingPage />} /><Route path="model-test" element={<TestPlaceholder type="model" />} /><Route path="latency-test" element={<TestPlaceholder type="latency" />} /><Route path="*" element={<p>页面不存在，请通过左侧菜单访问。</p>} /></Routes></div>
   </section>
 }

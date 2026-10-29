@@ -1,0 +1,30 @@
+.admin-provider-intro { color: var(--muted); line-height: 1.7; margin: 0 0 20px; }
+.admin-provider-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-bottom: 22px; }
+.admin-provider-stats article { border: 1px solid var(--line); border-radius: 14px; padding: 18px; background: var(--surface); display: flex; flex-direction: column; gap: 10px; }
+.admin-provider-stats span { color: var(--muted); font-size: 13px; }
+.admin-provider-stats strong { font-size: 28px; }
+.admin-provider-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 18px; }
+.admin-provider-search { display: flex; align-items: center; gap: 10px; flex: 1 1 240px; padding: 0 12px; border: 1px solid var(--line); border-radius: 10px; color: var(--muted); background: var(--surface); }
+.admin-provider-search input { width: 100%; min-width: 0; border: 0; background: transparent; padding: 12px 0; color: var(--ink); outline: none; }
+.admin-provider-search:focus-within { outline: 2px solid var(--primary); outline-offset: 2px; }
+.admin-provider-toolbar select { padding: 11px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); color: var(--ink); }
+.admin-provider-toolbar > span { font-size: 13px; color: var(--muted); }
+.admin-provider-success { display: flex; align-items: center; gap: 8px; color: #16a34a; padding: 12px; border: 1px solid currentColor; border-radius: 10px; }
+.admin-providers table { width: 100%; table-layout: fixed; }
+.admin-providers th:first-child { width: 31%; }
+.admin-providers th:nth-child(2) { width: 27%; }
+.admin-providers th:nth-child(3) { width: 16%; }
+.admin-providers td { overflow-wrap: anywhere; }
+.admin-providers td a { display: flex; align-items: center; gap: 5px; }
+.admin-providers td a svg { flex-shrink: 0; }
+.admin-providers .admin-actions { flex-wrap: wrap; }
+.admin-provider-models { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.admin-provider-fields { border: 0; margin: 0; padding: 0; min-width: 0; }
+.admin-provider-fields:disabled input, .admin-provider-fields:disabled textarea, .admin-provider-fields:disabled select { opacity: 1; color: var(--ink); -webkit-text-fill-color: var(--ink); }
+.admin-provider-fields h3 { margin-top: 22px; }
+@media (max-width: 760px) {
+  .admin-provider-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+  .admin-provider-stats article { padding: 14px; }
+  .admin-providers table { min-width: 720px; }
+  .admin-provider-toolbar > span { flex: 1; }
+}

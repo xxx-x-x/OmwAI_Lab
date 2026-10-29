@@ -1,5 +1,6 @@
 import { createHash, createHmac, randomUUID } from 'node:crypto'
 import { Redis } from 'ioredis'
+import { createRedisSessions } from './redis-sessions.js'
 
 export type CodePurpose = 'register' | 'reset-password'
 export const CODE_TTL_MS = 10 * 60 * 1000
@@ -56,7 +57,7 @@ export function createAuthRedis(url: string, prefix = 'omwai:auth:', secret = ''
       }
       if (connecting) await connecting
       if (client.status !== 'ready') throw new AuthRedisUnavailableError()
-      return Number(await client.eval(script, keys.length, ...keys, ...args))
+      return await client.eval(script, keys.length, ...keys, ...args)
     } catch {
       throw new AuthRedisUnavailableError()
     }
@@ -72,6 +73,7 @@ export function createAuthRedis(url: string, prefix = 'omwai:auth:', secret = ''
   }
 
   return {
+    sessions: createRedisSessions(evaluate, prefix),
     async issueCode(email: string, purpose: CodePurpose, code: string) {
       const token = randomUUID()
       const issued = await evaluate(ISSUE_CODE, keys(email, purpose), [token, hash(email, purpose, code), CODE_COOLDOWN_MS, CODE_TTL_MS])
@@ -85,7 +87,7 @@ export function createAuthRedis(url: string, prefix = 'omwai:auth:', secret = ''
     },
     async allowRequest(ip: string) {
       const id = createHash('sha256').update(ip).digest('hex')
-      return await evaluate(RATE_LIMIT, [`${prefix}rate:${id}`], [15 * 60 * 1000]) <= 20
+      return Number(await evaluate(RATE_LIMIT, [`${prefix}rate:${id}`], [15 * 60 * 1000])) <= 20
     },
     close() { client?.disconnect() },
   }

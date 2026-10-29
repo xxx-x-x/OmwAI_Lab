@@ -36,6 +36,7 @@ test('public comparison binds exact model and enforces reviewed active ownership
   assert.match(sql, /a\.user_id = s\.user_id/)
   assert.match(sql, /a\.id = q\.authorization_id/)
   assert.match(sql, /s\.local_owner_verified = 1/)
+  assert.ok(sql.includes("CASE WHEN s.directory_listed = 1 AND p.active = 1 THEN CONCAT('managed-', p.id) ELSE NULL END AS providerId"))
   assert.match(sql, /a\.revoked_at IS NULL/)
 })
 

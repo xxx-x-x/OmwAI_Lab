@@ -11,8 +11,9 @@
     "db:migrate": "node --env-file=.env --experimental-strip-types scripts/migrate-sqlite-to-mysql.ts",
     "db:sync-rankings": "node --env-file=.env --experimental-strip-types scripts/sync-model-rankings.ts",
     "db:sync-prices": "node --env-file=.env --experimental-strip-types scripts/sync-model-prices.ts",
+    "db:import-prices": "node --env-file=.env --experimental-strip-types scripts/import-model-prices.ts",
     "start": "node --env-file-if-exists=.env dist-server/production.js",
-    "test:server": "tsc -p tsconfig.server.json && node --test server/production.test.mjs"
+    "test:server": "tsc -p tsconfig.server.json && node --test server/*.test.mjs"
   },
   "dependencies": {
     "@lobehub/icons": "^6.13.0",

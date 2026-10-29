@@ -9,7 +9,7 @@ const payload = { success: true, data: [row], group_ratio: { standard: 0.5 } }
 test('new-api uses explicit token and group ratios, never price or fallback defaults', () => {
   assert.equal(parseNewApiPricing({ ...payload, data: [{ ...row, billing_mode: 'ratio' }] }).quotes.length, 1)
   const parsed = parseNewApiPricing(payload)
-  assert.deepEqual(parsed.quotes[0], { modelId: 'Exact-Model', groupName: 'standard', currency: 'USD', billingUnit: '1M tokens', inputPrice: '1.50000000', outputPrice: '6.00000000' })
+  assert.deepEqual(parsed.quotes[0], { modelId: 'Exact-Model', groupName: 'standard', groupMultiplier: 0.5, currency: 'USD', billingUnit: '1M tokens', inputPrice: '1.50000000', outputPrice: '6.00000000' })
   for (const change of [{ quota_type: 1 }, { completion_ratio: undefined }, { model_ratio: '1' }, { billing_expr: 'tiered' }, { billing_mode: 'tiered' }, { enable_groups: [] }, { enable_groups: ['unknown'] }]) assert.throws(() => parseNewApiPricing({ ...payload, data: [{ ...row, ...change }] }))
   assert.equal(parseNewApiPricing({ ...payload, data: [row, { ...row, quota_type: 1 }] }).unsupportedCount, 1)
   assert.throws(() => parseNewApiPricing({ ...payload, success: false }))
@@ -20,6 +20,7 @@ test('sub2api verified public model plaza retail formula excludes tiered/peak/ti
   const group = { name: 'group', rate_multiplier: 0.5, models: [model] }
   const wrap = (g: unknown) => ({ code: 0, data: { groups: [g] } })
   assert.throws(() => parseSub2ApiPricing({ code: 0, message: 'success', data: { groups: [] } }), /no_public_groups/)
+  assert.equal(parseSub2ApiPricing(wrap(group)).quotes[0].groupMultiplier, 0.5)
   assert.equal(parseSub2ApiPricing(wrap(group)).quotes[0].inputPrice, '1.00000000')
   assert.equal(parseSub2ApiPricing(wrap(group)).quotes[0].outputPrice, '4.00000000')
   for (const change of [{ peak_rate_enabled: true }, { rate_multiplier: undefined }, { user_rate_multiplier: 0 }]) assert.throws(() => parseSub2ApiPricing(wrap({ ...group, ...change })))
@@ -36,15 +37,21 @@ test('SSRF classifier rejects special/private/reserved, mapped and transition ad
 })
 function fixture() {
   const calls: { sql: string; values: unknown[] }[] = []
+  let groupAttempt: Date | null = null
+  let groupSnapshot: Record<string, unknown> | undefined
   let owned = true, enabled = false, revision = 0, platform = 'new-api', attempted: Date | null = null, synced: Date | null = null, error: unknown = null, quotes: unknown[] = [], upstream: unknown = payload, fetched = 0, failInsert = false
   const record = (sql: string, values: unknown[] = []) => { calls.push({ sql, values }) }
   const get = async (sql: string, values: unknown[] = []) => {
     record(sql, values)
+    if (sql.includes('FROM site_group_fetches')) return groupAttempt ? { website: 'https://example.com', attemptedAt: groupAttempt } : undefined
+    if (sql.includes('FROM site_group_snapshots')) return groupSnapshot
     if (sql.includes('FROM submissions')) return owned ? { id: 1, website: 'https://example.com' } : undefined
     return { enabled: Number(enabled), platform, revision, lastAttemptAt: attempted, syncedAt: synced, errorCode: error, unsupportedCount: 0 }
   }
   const run = async (sql: string, values: unknown[] = []) => {
     record(sql, values)
+    if (sql.startsWith('INSERT INTO site_group_fetches')) groupAttempt = new Date()
+    if (sql.startsWith('INSERT INTO site_group_snapshots')) groupSnapshot = { groupsJson: values[2], detectedAt: values[3], source: values[4] }
     if (sql.startsWith('INSERT INTO site_pricing_settings')) { enabled = Boolean(values[1]); platform = String(values[2]); revision++ }
     if (sql.includes('last_attempt_at = CURRENT_TIMESTAMP')) { attempted = new Date(); revision++ }
     if (sql.startsWith('DELETE FROM site_public_quotes')) quotes = []
@@ -54,9 +61,9 @@ function fixture() {
     return { affectedRows: 1 }
   }
   const db = { get, run, prepare: (sql: string) => ({ get: (...v: unknown[]) => get(sql, v), run: (...v: unknown[]) => run(sql, v), all: async (...v: unknown[]) => { record(sql, v); return quotes } }), transaction: async (fn: (connection: unknown) => Promise<unknown>) => { const saved = [...quotes]; try { return await fn({}) } catch (e) { quotes = saved; throw e } } } as unknown as Database
-  const request = async (method = 'GET', body = {}, options: { signedIn?: boolean; local?: number | null; origin?: string; sync?: boolean } = {}) => {
+  const request = async (method = 'GET', body = {}, options: { signedIn?: boolean; local?: number | null; origin?: string; sync?: boolean; groups?: boolean } = {}) => {
     let status = 0, result: any
-    await handlePublicPricing({ database: db, request: { method, headers: { host: 'localhost', origin: options.origin ?? 'http://localhost' }, socket: {} } as unknown as IncomingMessage, response: { setHeader() {} } as unknown as ServerResponse, url: new URL(`http://localhost/api/user/sites/1/pricing${options.sync ? '/sync' : ''}`), user: options.signedIn === false ? null : { id: 'oauth-id', login: 'owner', html_url: '' }, localUserId: options.local ?? null, readJson: async () => body, json: (_r, s, p) => { status = s; result = p }, fetchPricing: async () => { fetched++; if (upstream instanceof Error) throw upstream; return upstream } })
+    await handlePublicPricing({ database: db, request: { method, headers: { host: 'localhost', origin: options.origin ?? 'http://localhost' }, socket: {} } as unknown as IncomingMessage, response: { setHeader() {} } as unknown as ServerResponse, url: new URL(`http://localhost/api/user/sites/1/${options.groups ? 'groups' : 'pricing'}${options.sync ? '/sync' : ''}`), user: options.signedIn === false ? null : { id: 'oauth-id', login: 'owner', html_url: '' }, localUserId: options.local ?? null, readJson: async () => body, json: (_r, s, p) => { status = s; result = p }, fetchPricing: async () => { fetched++; if (upstream instanceof Error) throw upstream; return upstream } })
     return { status, body: result }
   }
   return { db, calls, request, setOwned: (v: boolean) => { owned = v }, setUpstream: (v: unknown) => { upstream = v }, resetThrottle: () => { attempted = null }, failInsert: () => { failInsert = true }, fetched: () => fetched }
@@ -85,6 +92,9 @@ test('sync snapshots replace atomically, throttle and retain last successful quo
   assert.equal((await f.request('POST', {}, { sync: true })).status, 200)
   const success = await f.request()
   assert.equal(success.body.quotes.length, 1)
+  const insert = f.calls.find(call => call.sql.startsWith('INSERT INTO site_public_quotes'))!
+  assert.match(insert.sql, /group_multiplier/)
+  assert.equal(insert.values[8], 0.5)
   assert.equal(success.body.sync.stale, false)
   assert.equal((await f.request('POST', {}, { sync: true })).status, 429)
   assert.equal(f.fetched(), 1)
@@ -103,7 +113,41 @@ test('public projection is exact, public-only, opted-in active and credential in
   await publicComparisonQuotes(f.db, 'Exact-Model')
   const call = f.calls[0]
   assert.match(call.sql, /BINARY q.model_id = BINARY \?/)
+  assert.ok(call.sql.includes("CONCAT('managed-', p.id) AS providerId"))
+  assert.match(call.sql, /COALESCE\(q.group_multiplier, gm.multiplier\) AS groupMultiplier/)
+  assert.match(call.sql, /BINARY gm.group_name = BINARY q.group_name/)
+  assert.match(call.sql, /BINARY gm.website = BINARY s.website/)
   for (const text of ["s.status = 'approved'", 's.directory_listed = 1', 'p.active = 1', 'ps.enabled = 1', "'public-interface'", "'reference'", "CONCAT('sync-'", 'q.synced_at AS syncedAt']) assert.ok(call.sql.includes(text), text)
   assert.doesNotMatch(call.sql, /credential|user_id|owner_identity|error_code/)
   assert.deepEqual(call.values, ['Exact-Model'])
+})
+
+test('owner group sync works without quote opt-in, stores snapshot and throttles repeated attempts', async () => {
+  const f = fixture()
+  const sync = { groups: true, sync: true }
+  assert.equal((await f.request('POST', {}, { ...sync, signedIn: false })).status, 401)
+  assert.equal((await f.request('POST', {}, { ...sync, origin: 'https://evil.test' })).status, 403)
+  f.setOwned(false)
+  assert.equal((await f.request('POST', {}, sync)).status, 404)
+  f.setOwned(true)
+  assert.equal((await f.request('GET', {}, { groups: true })).body.detectedAt, null)
+  const saved = await f.request('POST', {}, sync)
+  assert.equal(saved.status, 200)
+  assert.ok(saved.body.groups.length > 0)
+  assert.ok(saved.body.detectedAt)
+  assert.equal(f.fetched(), 1)
+  assert.equal((await f.request('POST', {}, sync)).status, 429)
+  assert.equal(f.fetched(), 1)
+  assert.ok(f.calls.every(c => !/^(DELETE FROM|INSERT INTO|UPDATE) site_public_quotes/.test(c.sql)))
+  assert.equal((await f.request()).body.settings.enabled, false)
+})
+
+test('failed group sync hides upstream errors and does not overwrite snapshot or prices', async () => {
+  const f = fixture()
+  f.setUpstream(Error('SECRET upstream details'))
+  const result = await f.request('POST', {}, { groups: true, sync: true })
+  assert.equal(result.status, 422)
+  assert.doesNotMatch(JSON.stringify(result), /SECRET/)
+  assert.ok(f.calls.every(c => !/^(DELETE FROM|INSERT INTO|UPDATE) site_(public_quotes|public_groups|group_snapshots)/.test(c.sql)))
+  assert.equal((await f.request('POST', {}, { groups: true, sync: true })).status, 429)
 })
