@@ -48,6 +48,9 @@ export type Database = ReturnType<typeof createDatabase>
 
 export async function initializeDatabase(database: Database) {
   const statements = [
+    `CREATE TABLE IF NOT EXISTS lab_monitor_lock (id TINYINT NOT NULL PRIMARY KEY) ENGINE=InnoDB`,
+    `INSERT IGNORE INTO lab_monitor_lock (id) VALUES (1)`,
+    `CREATE TABLE IF NOT EXISTS lab_monitors (id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY, owner_identity VARCHAR(255) COLLATE utf8mb4_bin NOT NULL, submission_id BIGINT UNSIGNED NOT NULL, monitor_id BIGINT UNSIGNED NULL UNIQUE, group_name VARCHAR(191) NOT NULL, model VARCHAR(191) NOT NULL, interval_seconds INT NOT NULL, endpoint VARCHAR(2048) NOT NULL, state VARCHAR(20) NOT NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, INDEX idx_lab_monitor_owner (owner_identity, created_at)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
     `CREATE TABLE IF NOT EXISTS analytics_metadata (id TINYINT UNSIGNED NOT NULL PRIMARY KEY, collected_since DATETIME(3) NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
     `CREATE TABLE IF NOT EXISTS analytics_events (event_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY, visitor_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, session_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, kind ENUM('pageview', 'outbound_intent', 'outbound_click') NOT NULL, path VARCHAR(128) NOT NULL, provider_id VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NULL, created_at DATETIME(3) NOT NULL, INDEX idx_analytics_time (created_at), INDEX idx_analytics_visitor_time (visitor_id, kind, created_at), INDEX idx_analytics_provider_time (provider_id, created_at)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
     `INSERT INTO analytics_metadata (id, collected_since) VALUES (1, UTC_TIMESTAMP(3)) ON DUPLICATE KEY UPDATE id = id`,

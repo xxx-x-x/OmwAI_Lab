@@ -242,3 +242,20 @@ curl.exe -I http://127.0.0.1:3000/
 `data/legacy-unused-model-prices.json` 仅归档原先未使用的前端静态种子，因无核对日期且当前准确性未知，不自动导入或用于运行时展示。原有服务端核对报价已全部迁移至 `data/curated-model-prices.json`；本次迁移沿用其既有出处与核对日期，不声称重新联网核实。
 
 离线验证：`npx tsc -p tsconfig.server.json --noEmit`；`node --experimental-strip-types --test server\pricing.test.ts server\admin-model-prices.test.ts server\openai-prices.test.ts server\volcengine-media-prices.test.ts`。测试使用内存数据库替身，不连接生产数据库、不发起远程请求。生产部署仍须自行备份并执行上述迁移/导入命令。
+
+## 模型可用性持续监控（复用 Uptime）
+
+`/site-management/latency-test` 通过 Lab 服务端 Socket.IO 连接现有 Uptime，无需修改 Uptime 源码或重建其数据。只允许按 MySQL `lab_monitors` 的精确绑定 ID 和 owner 管理 Lab 任务；不会扫描、接管、批量删除或按名称前缀授权。现有监控、状态页及历史保持不变。仅主动删除某个 Lab 任务时，才会删除该任务自己的 Uptime 历史；需要保留历史请暂停。
+
+部署（本次未执行线上修改、重启或请求）：
+1. 备份现有 Lab MySQL 及 Uptime 数据/配置。运行 `npm ci`、`npm run build`。Lab 启动时幂等创建 `lab_monitors`、`lab_monitor_lock`，不改动 Uptime 数据库。
+2. 在 **Uptime 所在主机/容器网络** 配置出站策略：拒绝所有私网、回环、链路本地、云元数据、保留地址（IPv4/IPv6），只允许必要公网目标及安全 DNS。规则必须对每次实际连接有效，防止 DNS rebinding。Lab 的首次/恢复时 DNS 校验不能代替 Uptime 的持续出站隔离。未完成隔离时保持 `UPTIME_EGRESS_ENFORCED=false`，功能不可启用。不要仅凭白名单或一次 DNS 检查把该项设为 true。
+3. 在服务器 `.env` 配置 `UPTIME_URL`（HTTPS 源站）、`UPTIME_TOKEN`（Uptime login JWT，普通 API key 不支持管理），或用户名/密码。优先使用独立账号且只授权必要权限（取决于 Uptime 版本）。JWT 失效需管理员轮换；不会绕过交互 MFA。凭证只能留服务端，禁止 VITE_、日志、前端配置。填入精确 `UPTIME_ALLOWED_ORIGINS`，仅允许与站点审核源站相同的 API，首版不支持独立 API 子域。
+4. 完成网络隔离后设 `UPTIME_EGRESS_ENFORCED=true`、`UPTIME_ENABLED=true`，按现有部署流程发布 Lab；不要重启/迁移 Uptime。先在本地或隔离环境验证，再由运维选择发布。无需调整现有状态页或通知。
+5. 用户选择已审核的自有站点/已保存公开分组（或未指定），填写模型 ID、同源 HTTPS 基址（根目录或 `/v1`）、专用低额度 KEY，确认费用。新建任务默认暂停，启用前再次确认。KEY 必须在上游事先绑定分组，Lab 分组字段仅为标签。
+
+边界：首版仅非流式 Chat Completions，请求 `max_tokens=16`、固定短提示，HTTP 200 且无 error、存在非空文本才成功；不测 TTFT、不认证模型身份、不判定回答语义。完整响应耗时不是首 token 延迟。推理模型及不兼容 max_tokens 的模型可能失败，失败也可能计费。每人最多 5 个任务、每日 10 次创建、全局 200 个，间隔 900–86400 秒，30 秒超时、不重试、不跟随重定向、TLS 验证开启、无通知。展示近 24 小时最多 300 条采样，非 SLA。服务重启可能额外检查；KEY 的供应商侧额度才是费用硬限制。
+
+KEY 只发送到 Uptime，**会明文留在 Uptime 监控配置及其备份中，Uptime 管理员可读**，Lab 不入库、不回传；请勿使用主账户 KEY，并定期轮换/撤销。Lab 只返回筛选后的时间、状态、耗时，不返回 Uptime 管理地址、登录凭证、monitor 对象或错误正文。接口复用当前 Redis session/Origin CSRF；无新增公共写接口。服务端按 owner 每分钟最多 30 请求，单 Lab 进程最多 4 个上游会话，DB 配额及任务操作锁跨进程生效；请求速率限制按进程，不是分布式限流。
+
+不确定性与恢复：创建前先占用 MySQL 配额，远端以 `active:false` 创建，拿到 ID 并成功入库后才允许管理。若网络中断、ack 丢失或入库失败，会保留 `pending`（占用配额）且绝不自动重试/按前缀接管；Uptime 可能留下暂停的孤立任务。管理员必须按完整任务 UUID、端点、模型、owner 手工核实，再修复绑定或清理孤立暂停任务；不得扫描原有监控进行批量清理。启停 ack 丢失时刷新状态历史看 Uptime 实际状态；删除 ack 丢失时需管理员核对并修复本地状态。不要直接修改已绑定 Uptime 监控配置，配置不匹配会拒绝后续操作。本次没有线上端到端验证；上线前须用隔离 Uptime 验证凭证权限、版本兼容性及网络策略。

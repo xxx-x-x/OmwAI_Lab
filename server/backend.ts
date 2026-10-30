@@ -15,6 +15,8 @@ import { createEmailService, type EmailConfig } from './email.js'
 import { AuthRedisUnavailableError, CODE_COOLDOWN_MS, createAuthRedis } from './auth-redis.js'
 import { createMfa, MfaError, MFA_RECENT_MS } from './mfa.js'
 import { createDetector } from './detector.js'
+import { handleAvailability } from './availability.js'
+import { uptimeConfig, type UptimeConfig } from './uptime.js'
 
 import { ADMIN_SESSION_TTL_MS, SESSION_TTL_MS, sessionCookie, sessionExpired, validWriteOrigin } from './session-security.js'
 
@@ -81,7 +83,7 @@ async function readJson(request: IncomingMessage) {
   return JSON.parse(body || '{}') as Record<string, unknown>
 }
 
-function createAuthMiddleware(clientId: string, clientSecret: string, googleClientId: string, googleClientSecret: string, databaseUrl: string, siteKey: string, emailConfig: EmailConfig, verificationSecret: string, secureCookies: boolean, turnstileSiteKey: string, turnstileSecretKey: string, redisUrl: string, redisPrefix: string, trustProxy: boolean, publicOrigin: string, mfaEncryptionKey: string) {
+function createAuthMiddleware(clientId: string, clientSecret: string, googleClientId: string, googleClientSecret: string, databaseUrl: string, siteKey: string, emailConfig: EmailConfig, verificationSecret: string, secureCookies: boolean, turnstileSiteKey: string, turnstileSecretKey: string, redisUrl: string, redisPrefix: string, trustProxy: boolean, publicOrigin: string, mfaEncryptionKey: string, uptime: UptimeConfig) {
   const authStore = createAuthRedis(redisUrl, redisPrefix, verificationSecret)
   let databaseInstance: ReturnType<typeof createDatabase> | undefined
   const database = new Proxy({} as ReturnType<typeof createDatabase>, { get: (_target, property) => Reflect.get(databaseInstance ??= createDatabase(databaseUrl), property) })
@@ -456,6 +458,7 @@ function createAuthMiddleware(clientId: string, clientSecret: string, googleClie
         return json(response, 502, { error: error instanceof Error ? error.message : 'Google 登录失败' })
       }
     }
+    if (url.pathname === '/api/user/availability' || url.pathname.startsWith('/api/user/availability/')) return handleAvailability({ database, request, response, url, user, localUserId: user ? session?.localUserId ?? null : null, config: uptime, readJson, json })
     if (url.pathname === '/api/directory' || url.pathname === '/api/submissions' || url.pathname === '/api/user/sites' || /^\/api\/user\/sites\/\d+\/(listing|invoice|billing|revision|logo(?:\/(preview|refetch|image))?)$/.test(url.pathname)) {
       return handleSiteManagement({ database, request, response, url, user, localUserId: user ? session?.localUserId ?? null : null, key: siteKey, readJson, json })
     }
@@ -572,7 +575,7 @@ export type Middleware = (request: IncomingMessage, response: ServerResponse, ne
 
 export function createBackend(env: Record<string, string | undefined>) {
   const detector = createDetector(env)
-  const auth = createAuthMiddleware(env.GITHUB_CLIENT_ID || '', env.GITHUB_CLIENT_SECRET || '', env.GOOGLE_CLIENT_ID || '', env.GOOGLE_CLIENT_SECRET || '', env.DATABASE_URL || '', env.SITE_CREDENTIAL_ENCRYPTION_KEY || '', { host: env.SMTP_HOST || '', port: Number(env.SMTP_PORT || 587), secure: env.SMTP_SECURE === 'true', user: env.SMTP_USER || '', password: env.SMTP_PASSWORD || '', from: env.SMTP_FROM || '' }, env.EMAIL_VERIFICATION_SECRET || '', env.COOKIE_SECURE === 'true' || env.NODE_ENV === 'production' || env.PUBLIC_ORIGIN?.startsWith('https://') === true, env.TURNSTILE_SITE_KEY || '', env.TURNSTILE_SECRET_KEY || '', env.REDIS_URL || '', env.REDIS_KEY_PREFIX || 'omwai:auth:', env.TRUST_PROXY === 'true', env.PUBLIC_ORIGIN || '', env.MFA_ENCRYPTION_KEY || '')
+  const auth = createAuthMiddleware(env.GITHUB_CLIENT_ID || '', env.GITHUB_CLIENT_SECRET || '', env.GOOGLE_CLIENT_ID || '', env.GOOGLE_CLIENT_SECRET || '', env.DATABASE_URL || '', env.SITE_CREDENTIAL_ENCRYPTION_KEY || '', { host: env.SMTP_HOST || '', port: Number(env.SMTP_PORT || 587), secure: env.SMTP_SECURE === 'true', user: env.SMTP_USER || '', password: env.SMTP_PASSWORD || '', from: env.SMTP_FROM || '' }, env.EMAIL_VERIFICATION_SECRET || '', env.COOKIE_SECURE === 'true' || env.NODE_ENV === 'production' || env.PUBLIC_ORIGIN?.startsWith('https://') === true, env.TURNSTILE_SITE_KEY || '', env.TURNSTILE_SECRET_KEY || '', env.REDIS_URL || '', env.REDIS_KEY_PREFIX || 'omwai:auth:', env.TRUST_PROXY === 'true', env.PUBLIC_ORIGIN || '', env.MFA_ENCRYPTION_KEY || '', uptimeConfig(env))
   const handle: Middleware = async (request, response, next) => {
     try {
       const path = new URL(request.url || '/', 'http://localhost').pathname
