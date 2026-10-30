@@ -1,0 +1,41 @@
+.directory-monitor-history { display: inline-flex; flex-direction: column; align-items: flex-end; gap: 3px; width: 94px; flex: none; color: var(--theme-muted, #78838f); }
+.directory-monitor-history-label { font-size: 10px; line-height: 12px; }
+.monitor-up .directory-monitor-history-label { color: #16a466; }
+.monitor-down .directory-monitor-history-label { color: #e34e58; }
+.directory-monitor-history-bars { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); grid-template-rows: repeat(2, 1fr); gap: 3px 2px; width: 100%; height: 27px; }
+.directory-monitor-history-bar { min-width: 0; border-radius: 2px; background: var(--theme-line, #dce1e8); }
+.directory-monitor-history-bar.is-up { background: #13cf75; }
+.directory-monitor-history-bar.is-light-green { background: #86dc9c; }
+.directory-monitor-history-bar.is-orange { background: #f3a43b; }
+.directory-monitor-history-bar.is-down { background: #ef5261; }
+.directory-monitor-history-bar.is-unknown { background: var(--theme-line, #cbd2dc); }
+.directory-monitor-history-bar:hover { opacity: .65; }
+.ranking-head, .ranking-row { grid-template-columns: 2.2fr 1.3fr .75fr .55fr .8fr .7fr .9fr 94px; }
+.ranking-head > :last-child { text-align: right; }
+.big-status .directory-monitor-history { width: 100%; align-items: flex-end; }
+.big-status .directory-monitor-history-bars { height: 30px; }
+.directory-monitor-history-label { white-space: nowrap; font-size: 10px; }
+.provider-grid.directory-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.provider-card.directory-provider-card { padding: 14px; border-radius: 12px; min-width: 0; }
+.compact-card-header { display: flex; align-items: center; gap: 7px; }
+.compact-card-header .provider-logo { width: 30px; height: 30px; border-radius: 8px; flex: none; }
+.compact-card-header h3 { margin: 0; font-size: 14px; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.compact-card-verified { color: var(--theme-success, #288367); flex: none; }
+.compact-card-arrow { color: var(--muted); margin-left: auto; flex: none; }
+.compact-card-models { display: flex; gap: 4px; height: 22px; align-items: center; margin: 8px 0; overflow: hidden; }
+.compact-card-models > span { display: inline-flex; background: var(--theme-surface-muted, #f1f3f8); padding: 3px; border-radius: 4px; }
+.compact-card-models svg, .compact-card-models img { width: 15px; height: 15px; }
+.compact-card-monitoring { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.compact-card-metrics { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.compact-card-metrics > div { display: flex; align-items: baseline; gap: 7px; white-space: nowrap; }
+.compact-card-metrics span { color: var(--muted); font-size: 11px; }
+.compact-card-metrics strong { font-size: 12px; color: var(--ink); font-variant-numeric: tabular-nums; }
+.compact-card-monitoring .directory-monitor-history { width: 84px; }
+.compact-card-monitoring .directory-monitor-history-label { font-size: 9px; }
+.compact-card-monitoring .directory-monitor-history-bars { height: 23px; }
+.compact-card-footer { display: flex; justify-content: space-between; gap: 8px; border-top: 1px solid var(--line); margin-top: 10px; padding-top: 8px; color: var(--muted); font-size: 11px; }
+.compact-card-footer > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 1100px) { .provider-grid.directory-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (max-width: 800px) { .provider-grid.directory-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 480px) { .provider-grid.directory-grid { grid-template-columns: 1fr; } }
+

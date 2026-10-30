@@ -74,6 +74,11 @@ export async function initializeDatabase(database: Database) {
     `CREATE TABLE IF NOT EXISTS model_price_syncs (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, source_url VARCHAR(2048) NOT NULL, model_count INT NOT NULL, provider_count INT NOT NULL, synced_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
   ]
   for (const statement of statements) await database.run(statement)
+  const monitorColumns = await database.all<{ Field: string } & DatabaseRow>('SHOW COLUMNS FROM lab_monitors')
+  if (!monitorColumns.some(column => column.Field === 'task_group_id')) {
+    try { await database.run('ALTER TABLE lab_monitors ADD COLUMN task_group_id CHAR(36) CHARACTER SET ascii COLLATE ascii_bin NULL AFTER id') }
+    catch (error) { if ((error as { code?: string }).code !== 'ER_DUP_FIELDNAME') throw error }
+  }
   await database.run(`CREATE TABLE IF NOT EXISTS site_public_groups (submission_id BIGINT UNSIGNED NOT NULL, website VARCHAR(2048) NOT NULL, group_name VARCHAR(191) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL, multiplier DOUBLE NOT NULL, detected_at DATETIME(3) NOT NULL, source_url VARCHAR(2048) NOT NULL, PRIMARY KEY (submission_id, group_name), FOREIGN KEY (submission_id) REFERENCES submissions(id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
   await database.run(`CREATE TABLE IF NOT EXISTS site_group_fetches (submission_id BIGINT UNSIGNED NOT NULL PRIMARY KEY, website VARCHAR(2048) NOT NULL, attempted_at DATETIME(3) NOT NULL, FOREIGN KEY (submission_id) REFERENCES submissions(id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
   await database.run(`CREATE TABLE IF NOT EXISTS site_group_snapshots (submission_id BIGINT UNSIGNED NOT NULL PRIMARY KEY, website VARCHAR(2048) NOT NULL, groups_json JSON NOT NULL, detected_at DATETIME(3) NOT NULL, source_url VARCHAR(2048) NOT NULL, FOREIGN KEY (submission_id) REFERENCES submissions(id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)

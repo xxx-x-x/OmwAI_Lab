@@ -1,76 +1,55 @@
 import assert from 'node:assert/strict'
-import { createDecipheriv } from 'node:crypto'
 import { test } from 'node:test'
-import { encryptCredential, validateQuote, handleSiteGroups } from './site-groups.ts'
-import type { Database } from './mysql.ts'
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import type { Database } from './mysql.ts'
+import { handleSiteGroups, isRetiredSiteGroupsRoute } from './site-groups.ts'
 
-const quote = { authorizationId: 1, modelId: 'GPT-4o', currency: 'USD', billingUnit: '1M tokens', inputPrice: '0', outputPrice: '10.25', sourceUrl: 'https://example.com/pricing' }
+async function call(database: Database, path: string, method = 'GET') {
+  let result: { status: number; payload: any } | undefined
+  const headers: Record<string, unknown> = {}
+  await handleSiteGroups({ database, request: { method } as IncomingMessage, response: { setHeader: (name: string, value: unknown) => { headers[name] = value } } as unknown as ServerResponse, url: new URL(path, 'http://localhost'), json: (_response, status, payload) => { result = { status, payload } } })
+  assert.ok(result)
+  assert.equal(headers['cache-control'], 'no-store')
+  return result
+}
 
-test('AES-GCM encrypts with fresh nonces and rejects missing or invalid keys', () => {
-  const key = 'ab'.repeat(32)
-  const value = encryptCredential('secret', key)
-  assert.notEqual(value, encryptCredential('secret', key))
-  assert.ok(!value.includes('secret'))
-  const [, iv, tag, ciphertext] = value.split(':')
-  const decipher = createDecipheriv('aes-256-gcm', Buffer.from(key, 'hex'), Buffer.from(iv, 'base64'))
-  decipher.setAuthTag(Buffer.from(tag, 'base64'))
-  assert.equal(Buffer.concat([decipher.update(Buffer.from(ciphertext, 'base64')), decipher.final()]).toString(), 'secret')
-  assert.throws(() => encryptCredential('secret', ''))
-})
+const inaccessibleDatabase = new Proxy({} as Database, { get() { assert.fail('Retired or invalid requests must not access the database') } })
 
-test('manual quotes require exact IDs, source and bounded decimal prices', () => {
-  assert.equal(validateQuote(quote).model, 'GPT-4o')
-  for (const change of [{ modelId: ' GPT-4o' }, { inputPrice: -1 }, { inputPrice: '1e3' }, { sourceUrl: 'https://example.com/?key=secret' }, { inputPrice: null, outputPrice: null }]) assert.throws(() => validateQuote({ ...quote, ...change }))
-})
-
-test('public comparison binds exact model and enforces reviewed active ownership', async () => {
-  let sql = '', values: unknown[] = [], status = 0
-  const database = { prepare: (query: string) => ({ all: async (...args: unknown[]) => { sql = query; values = args; return [] } }) } as unknown as Database
-  await handleSiteGroups({ database, request: { method: 'GET' } as IncomingMessage, response: { setHeader() {} } as unknown as ServerResponse, url: new URL('http://localhost/api/site-comparison?modelId=GPT-4o'), localUserId: null, adminId: null, key: '', readJson: async () => ({}), json: (_res, code) => { status = code } })
-  assert.equal(status, 200)
-  assert.deepEqual(values, ['GPT-4o'])
-  assert.match(sql, /BINARY q\.model_id = BINARY \?/)
-  assert.match(sql, /q\.status = 'approved'/)
-  assert.match(sql, /s\.status = 'approved'/)
-  assert.match(sql, /a\.user_id = s\.user_id/)
-  assert.match(sql, /a\.id = q\.authorization_id/)
-  assert.match(sql, /s\.local_owner_verified = 1/)
-  assert.ok(sql.includes("CASE WHEN s.directory_listed = 1 AND p.active = 1 THEN CONCAT('managed-', p.id) ELSE NULL END AS providerId"))
-  assert.match(sql, /a\.revoked_at IS NULL/)
-})
-
-test('quote submission binds authorization to the owned site and active group', async () => {
-  let sql = '', values: unknown[] = [], status = 0
-  const database = { prepare: (query: string) => ({ get: async () => ({ id: 1 }), run: async (...args: unknown[]) => { sql = query; values = args; return { affectedRows: 0 } } }) } as unknown as Database
-  await handleSiteGroups({ database, request: { method: 'POST', headers: { origin: 'http://localhost', host: 'localhost' }, socket: {} } as unknown as IncomingMessage, response: { setHeader() {} } as unknown as ServerResponse, url: new URL('http://localhost/api/user/sites/1/quotes'), localUserId: 2, adminId: null, key: '', readJson: async () => ({ ...quote, authorizationId: 42 }), json: (_res, code) => { status = code } })
-  assert.equal(status, 409)
-  assert.match(sql, /a.id = \? AND s.id = \? AND s.user_id = \?/)
-  assert.match(sql, /a.revoked_at IS NULL AND a.credential IS NOT NULL/)
-  assert.deepEqual(values.slice(-3), [42, 1, 2])
-})
-
-test('revocation targets only the named group and its quotes', async () => {
+test('public comparison returns only automatically synced public quotes with exact model binding', async () => {
   const calls: { sql: string; values: unknown[] }[] = []
-  const database = {
-    prepare: () => ({ get: async () => ({ id: 1 }) }),
-    transaction: async (fn: (connection: unknown) => Promise<void>) => fn({}),
-    run: async (sql: string, values: unknown[]) => { calls.push({ sql, values }) },
-  } as unknown as Database
-  let status = 0
-  await handleSiteGroups({ database, request: { method: 'DELETE', headers: { origin: 'http://localhost', host: 'localhost' }, socket: {} } as unknown as IncomingMessage, response: { setHeader() {} } as unknown as ServerResponse, url: new URL('http://localhost/api/user/sites/1/authorizations/group%20A'), localUserId: 2, adminId: null, key: '', readJson: async () => ({}), json: (_res, code) => { status = code } })
-  assert.equal(status, 200)
-  assert.equal(calls.length, 2)
-  for (const call of calls) {
-    assert.match(call.sql, /BINARY (?:a\.)?group_name = BINARY \?/)
-    assert.deepEqual(call.values, [1, 2, 'group A'])
-  }
-  assert.match(calls[0].sql, /credential = NULL/)
-  assert.match(calls[1].sql, /q.authorization_id/)
+  const rows = [{ id: 7, modelId: 'GPT-4o', sourceType: 'public', sourceStatus: 'synced', syncedAt: new Date().toISOString() }]
+  const database = { prepare: (sql: string) => ({ all: async (...values: unknown[]) => { calls.push({ sql, values }); return rows } }) } as unknown as Database
+  const result = await call(database, '/api/site-comparison?modelId=GPT-4o')
+  assert.equal(result.status, 200)
+  assert.deepEqual(result.payload.quotes, [{ ...rows[0], stale: false }])
+  assert.equal(calls.length, 1)
+  assert.deepEqual(calls[0].values, ['GPT-4o'])
+  assert.match(calls[0].sql, /FROM site_public_quotes q/)
+  assert.match(calls[0].sql, /BINARY q\.model_id = BINARY \?/)
+  for (const condition of ["s.status = 'approved'", 's.directory_listed = 1', 'p.active = 1', 'ps.enabled = 1']) assert.ok(calls[0].sql.includes(condition))
+  assert.doesNotMatch(calls[0].sql, /group_authorization/)
 })
 
-test('owner endpoints reject OAuth-only sessions before database access', async () => {
-  let status = 0
-  await handleSiteGroups({ database: {} as Database, request: { method: 'GET' } as IncomingMessage, response: { setHeader() {} } as unknown as ServerResponse, url: new URL('http://localhost/api/user/sites/1/quotes'), localUserId: null, adminId: null, key: '', readJson: async () => ({}), json: (_res, code) => { status = code } })
-  assert.equal(status, 401)
+test('public comparison handles empty synced results without querying historical quotes', async () => {
+  let queries = 0
+  const database = { prepare: () => ({ all: async () => { queries++; return [] } }) } as unknown as Database
+  assert.deepEqual(await call(database, '/api/site-comparison?modelId=GPT-4o'), { status: 200, payload: { quotes: [] } })
+  assert.equal(queries, 1)
+})
+
+test('invalid public comparison models and methods never query the database', async () => {
+  for (const query of ['', '?modelId=', `?modelId=${'x'.repeat(192)}`]) assert.equal((await call(inaccessibleDatabase, `/api/site-comparison${query}`)).status, 400)
+  for (const method of ['POST', 'PUT', 'PATCH', 'DELETE']) assert.equal((await call(inaccessibleDatabase, '/api/site-comparison?modelId=GPT-4o', method)).status, 404)
+})
+
+test('all historical authorization, submission and review endpoints are gone without database access', async () => {
+  const paths = ['/api/user/sites/1/authorizations', '/api/user/sites/1/authorizations/Group%20A', '/api/user/sites/1/quotes', '/api/user/sites/1/quotes/42', '/api/admin/site-quotes', '/api/admin/site-quotes/42']
+  for (const path of paths) {
+    assert.equal(isRetiredSiteGroupsRoute(path), true)
+    for (const method of ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']) assert.equal((await call(inaccessibleDatabase, path, method)).status, 410)
+  }
+})
+
+test('automatic pricing and group sync routes are not retired', () => {
+  for (const path of ['/api/site-comparison', '/api/user/sites/1/pricing', '/api/user/sites/1/pricing/sync', '/api/user/sites/1/groups', '/api/user/sites/1/groups/sync']) assert.equal(isRetiredSiteGroupsRoute(path), false)
 })

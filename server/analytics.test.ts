@@ -112,7 +112,7 @@ test('collector rejects unpublished providers and reports database errors withou
   assert.equal(status, 503)
 })
 
-test('dashboard aggregates entire tables, valid pending authorizations, distinct visitors, zero-filled dates and local accounts', async () => {
+test('dashboard aggregates active review queues without historical quotes, distinct visitors, zero-filled dates and local accounts', async () => {
   const queries: string[] = []
   const db = { prepare: (sql: string) => {
     queries.push(sql)
@@ -121,7 +121,7 @@ test('dashboard aggregates entire tables, valid pending authorizations, distinct
         if (sql.includes('AS pending,')) return { pending: 700, providers: 600, users: 550, logs: 900 }
         if (sql.includes('FROM analytics_events')) return { pv: '8', uv: '4', outboundClicks: '3', outboundVisitors: '3', convertedVisitors: '2' }
         if (sql.includes('AS newUsers')) return { newUsers: '3', newSubmissions: '2', publicProviders: '4', localUsers: '550' }
-        if (sql.includes('pending_items')) return { submissions: 700, revisions: 2, quotes: 1, oldestEpoch: 1700000000, overdue: 3 }
+        if (sql.includes('pending_items')) return { submissions: 700, revisions: 2, oldestEpoch: 1700000000, overdue: 3 }
         if (sql.includes('analytics_metadata')) return { collectedSince: '2026-10-28T00:00:00.000Z' }
         return { rankingModels: 601, priceModels: 800, pricingFailures: 2, rankingEpoch: 1700000000 }
       },
@@ -146,7 +146,10 @@ test('dashboard aggregates entire tables, valid pending authorizations, distinct
   assert.equal(result.analytics.health.rankingModels, 601)
   assert.equal(result.analytics.recentLogs[0].created_at, '2023-11-14T22:13:20.000Z')
   const pending = queries.find(sql => sql.includes('pending_items'))!
-  for (const condition of ['a.user_id = s.user_id', 'a.revoked_at IS NULL', 'a.credential IS NOT NULL', 's.local_owner_verified = 1']) assert.ok(pending.includes(condition))
+  assert.ok(pending.includes('FROM submissions'))
+  assert.ok(pending.includes('FROM site_revisions'))
+  assert.ok(!pending.includes('group_authorization'))
+  assert.ok(!('quotes' in result.analytics.pending))
   assert.ok(queries.some(sql => sql.includes("p.active = 1 AND s.status = 'approved' AND s.directory_listed = 1")))
   const eventTotals = queries.find(sql => sql.includes('FROM analytics_events e WHERE') && !sql.includes('GROUP BY'))!
   assert.match(eventTotals, /COUNT\(DISTINCT CASE WHEN kind = 'pageview' THEN visitor_id END\) AS uv/)

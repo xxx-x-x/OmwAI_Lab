@@ -63,7 +63,10 @@
   --theme-glass: rgba(26, 34, 50, .92);
 }
 * { box-sizing: border-box; }
-html { scroll-behavior: smooth; }
+html { scroll-behavior: smooth; scrollbar-gutter: stable; }
+@supports not (scrollbar-gutter: stable) {
+  html { overflow-y: scroll; }
+}
 body { margin: 0; min-width: 320px; min-height: 100vh; background: var(--page-bg); font-size: 16px; line-height: 1.65; }
 button, input, textarea, select { font: inherit; }
 button, a { -webkit-tap-highlight-color: transparent; }

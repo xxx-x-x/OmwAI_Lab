@@ -1,4 +1,4 @@
-type SiteQuote = { id: string | number; siteId?: number; website?: string; siteName?: string; groupMultiplier?: string | number | null }
+type SiteQuote = { id: string | number; modelId?: string; siteId?: number; website?: string; siteName?: string; groupMultiplier?: string | number | null }
 
 export function multiplier(quote: SiteQuote) {
   const value = quote.groupMultiplier
@@ -16,7 +16,8 @@ export function compareMultipliers(a: SiteQuote, b: SiteQuote, descending = fals
 export function lowestPerSite<T extends SiteQuote>(quotes: T[]): T[] {
   const sites = new Map<string, T>()
   for (const quote of quotes) {
-    const key = quote.siteId != null ? `id:${quote.siteId}` : quote.website ? `url:${quote.website}` : quote.siteName ? `name:${quote.siteName}` : `quote:${quote.id}`
+    const site = quote.siteId != null ? `id:${quote.siteId}` : quote.website ? `url:${quote.website}` : quote.siteName ? `name:${quote.siteName}` : `quote:${quote.id}`
+    const key = JSON.stringify([site, quote.modelId ?? null])
     const current = sites.get(key)
     if (!current || compareMultipliers(quote, current) < 0) sites.set(key, quote)
   }

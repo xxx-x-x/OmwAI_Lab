@@ -1,5 +1,6 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Database } from './mysql.js'
+import type { PublicMonitoring } from './directory-monitoring.ts'
 import { handleLogoSettings } from './site-logo-settings.ts'
 import { handleSiteRevision, ownerRevisions, revisionView } from './site-revisions.ts'
 
@@ -44,7 +45,7 @@ const fields = `s.id, s.user_id, s.submitter_login, s.name, s.website, s.models,
   DATE_FORMAT(s.founded_at, '%Y-%m-%d') AS foundedAt, s.description, s.invoice_supported AS invoice, s.billing_type AS billingType, s.billing_details AS billingDetails, s.probe_notes AS probeNotes, s.probe_credential IS NOT NULL AS hasCredential, s.directory_listed AS directoryListed`
 const ownership = '(BINARY s.owner_identity = BINARY ? OR (? IS NOT NULL AND s.user_id = ?))'
 const flags = (row: Record<string, unknown>): Record<string, unknown> => ({ ...row, invoice: row.invoice == null ? null : Boolean(row.invoice), hasCredential: Boolean(row.hasCredential), directoryListed: Boolean(row.directoryListed) })
-type Context = { database: Database; request: IncomingMessage; response: ServerResponse; url: URL; user: SiteOwner | null; localUserId: number | null; key: string; adminId?: number; onApproved?: () => void; readJson: (req: IncomingMessage) => Promise<Record<string, unknown>>; json: (res: ServerResponse, status: number, payload: unknown) => void }
+type Context = { database: Database; request: IncomingMessage; response: ServerResponse; url: URL; user: SiteOwner | null; localUserId: number | null; key: string; monitoring?: () => Promise<Map<number, PublicMonitoring>>; adminId?: number; onApproved?: () => void; readJson: (req: IncomingMessage) => Promise<Record<string, unknown>>; json: (res: ServerResponse, status: number, payload: unknown) => void }
 
 export async function handleSiteManagement(c: Context) {
   const { database: db, request: req, response: res, url, user, localUserId } = c
@@ -52,8 +53,9 @@ export async function handleSiteManagement(c: Context) {
   res.setHeader('cache-control', 'no-store')
   try {
     if (url.pathname === '/api/directory' && req.method === 'GET') {
-      const sites = await db.prepare(`SELECT CONCAT('managed-', p.id) AS id, p.name, p.website, p.models, p.pricing, CASE WHEN l.image IS NOT NULL AND l.website = p.website THEN CONCAT('/api/site-logos/', p.id, '?v=', l.digest) ELSE NULL END AS logoUrl, s.description, s.invoice_supported AS invoice, s.billing_type AS billingType, s.billing_details AS billingDetails, DATE_FORMAT(s.founded_at, '%Y-%m-%d') AS foundedAt, s.updated_at AS updatedAt FROM managed_providers p JOIN submissions s ON s.id = p.submission_id LEFT JOIN site_logos l ON l.provider_id = p.id WHERE p.active = 1 AND s.status = 'approved' AND s.directory_listed = 1 ORDER BY p.id DESC`).all()
-      return send(200, { sites: sites.map(site => ({ ...site, invoice: site.invoice == null ? null : Boolean(site.invoice) })) })
+      const sites = await db.prepare(`SELECT CONCAT('managed-', p.id) AS id, s.id AS submissionId, p.name, p.website, p.models, p.pricing, CASE WHEN l.image IS NOT NULL AND l.website = p.website THEN CONCAT('/api/site-logos/', p.id, '?v=', l.digest) ELSE NULL END AS logoUrl, s.description, s.invoice_supported AS invoice, s.billing_type AS billingType, s.billing_details AS billingDetails, DATE_FORMAT(s.founded_at, '%Y-%m-%d') AS foundedAt, s.updated_at AS updatedAt FROM managed_providers p JOIN submissions s ON s.id = p.submission_id LEFT JOIN site_logos l ON l.provider_id = p.id WHERE p.active = 1 AND s.status = 'approved' AND s.directory_listed = 1 ORDER BY p.id DESC`).all()
+      const monitoring = await c.monitoring?.().catch(() => new Map<number, PublicMonitoring>())
+      return send(200, { sites: sites.map(({ submissionId, ...site }) => ({ ...site, invoice: site.invoice == null ? null : Boolean(site.invoice), monitoring: monitoring?.get(Number(submissionId)) ?? { status: 'unknown', uptime: null, latency: null, samples: 0, monitors: 0, checkedAt: null, hours: 24 } })) })
     }
     if (!user) return send(401, { error: '请先登录' })
     const identity = ownerIdentity(user, localUserId)

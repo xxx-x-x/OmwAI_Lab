@@ -3,7 +3,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { createDatabase, initializeDatabase } from './mysql.js'
 import { mergePrices } from './pricing.js'
 import { loadPrices } from './price-store.js'
-import { handleSiteGroups } from './site-groups.js'
+import { handleSiteGroups, isRetiredSiteGroupsRoute } from './site-groups.js'
 import { handlePublicPricing } from './public-pricing.js'
 import { createGroupCache, readGroupSnapshot } from './group-cache.js'
 import { handleSiteManagement } from './site-management.js'
@@ -16,6 +16,7 @@ import { AuthRedisUnavailableError, CODE_COOLDOWN_MS, createAuthRedis } from './
 import { createMfa, MfaError, MFA_RECENT_MS } from './mfa.js'
 import { createDetector } from './detector.js'
 import { handleAvailability } from './availability.js'
+import { createDirectoryMonitoring } from './directory-monitoring.js'
 import { uptimeConfig, type UptimeConfig } from './uptime.js'
 
 import { ADMIN_SESSION_TTL_MS, SESSION_TTL_MS, sessionCookie, sessionExpired, validWriteOrigin } from './session-security.js'
@@ -87,6 +88,7 @@ function createAuthMiddleware(clientId: string, clientSecret: string, googleClie
   const authStore = createAuthRedis(redisUrl, redisPrefix, verificationSecret)
   let databaseInstance: ReturnType<typeof createDatabase> | undefined
   const database = new Proxy({} as ReturnType<typeof createDatabase>, { get: (_target, property) => Reflect.get(databaseInstance ??= createDatabase(databaseUrl), property) })
+  const directoryMonitoring = createDirectoryMonitoring(database, uptime)
   const emailService = createEmailService(emailConfig)
   const siteLogos = createSiteLogoCache(database)
   const siteGroups = createGroupCache(database)
@@ -151,6 +153,7 @@ function createAuthMiddleware(clientId: string, clientSecret: string, googleClie
 
   const handle: Middleware = async (request, response, next) => {
     const url = new URL(request.url ?? '/', 'http://localhost')
+    if (isRetiredSiteGroupsRoute(url.pathname)) return handleSiteGroups({ database, request, response, url, json })
     if (request.method === 'POST' && ['/api/auth/email-code', '/api/auth/register', '/api/auth/login', '/api/auth/reset-password'].includes(url.pathname)) {
       const forwarded = trustProxy ? request.headers['x-forwarded-for'] : undefined
       const ip = (Array.isArray(forwarded) ? forwarded[0] : forwarded?.split(',')[0])?.trim() || request.socket.remoteAddress || 'unknown'
@@ -282,10 +285,8 @@ function createAuthMiddleware(clientId: string, clientSecret: string, googleClie
       return handlePublicPricing({ database, request, response, url, user, localUserId: user ? session?.localUserId ?? null : null, readJson, json })
     }
 
-    if (url.pathname === '/api/site-comparison' || /^\/api\/user\/sites\/\d+\/(?:authorizations(?:\/[^/]+)?|quotes)$/.test(url.pathname) || /^\/api\/admin\/site-quotes(?:\/\d+)?$/.test(url.pathname)) {
-      const localUserId = user ? session?.localUserId ?? null : null
-      const admin = localUserId && user?.role === 'admin' ? await database.prepare("SELECT id FROM users WHERE id = ? AND role = 'admin'").get(localUserId) : null
-      return handleSiteGroups({ database, request, response, url, localUserId, adminId: admin ? localUserId : null, key: siteKey, readJson, json })
+    if (url.pathname === '/api/site-comparison') {
+      return handleSiteGroups({ database, request, response, url, json })
     }
 
     if (url.pathname === '/api/auth/me' && request.method === 'GET') return json(response, 200, { user })
@@ -460,7 +461,7 @@ function createAuthMiddleware(clientId: string, clientSecret: string, googleClie
     }
     if (url.pathname === '/api/user/availability' || url.pathname.startsWith('/api/user/availability/')) return handleAvailability({ database, request, response, url, user, localUserId: user ? session?.localUserId ?? null : null, config: uptime, readJson, json })
     if (url.pathname === '/api/directory' || url.pathname === '/api/submissions' || url.pathname === '/api/user/sites' || /^\/api\/user\/sites\/\d+\/(listing|invoice|billing|revision|logo(?:\/(preview|refetch|image))?)$/.test(url.pathname)) {
-      return handleSiteManagement({ database, request, response, url, user, localUserId: user ? session?.localUserId ?? null : null, key: siteKey, readJson, json })
+      return handleSiteManagement({ database, request, response, url, user, localUserId: user ? session?.localUserId ?? null : null, key: siteKey, monitoring: directoryMonitoring, readJson, json })
     }
     if (url.pathname.startsWith('/api/admin/')) {
       if (!user) return json(response, 401, { error: '请先登录' })
