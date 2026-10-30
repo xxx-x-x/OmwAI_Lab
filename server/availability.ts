@@ -2,9 +2,10 @@ import { randomUUID } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Database } from './mysql.js'
 import { ownerIdentity, type SiteOwner } from './site-management.js'
-import { monitorPayload, safeBeats, validateMonitorTarget, withUptime, type UptimeConfig, type UptimeRpc } from './uptime.js'
+import { monitorPayload, requireUptimeEncryption, safeBeats, validateMonitorTarget, withUptime, type UptimeConfig, type UptimeRpc } from './uptime.js'
+import { fetchAvailabilityModels, validMonitorKey } from './availability-models.js'
 
-type Context = { database: Database; request: IncomingMessage; response: ServerResponse; url: URL; user: SiteOwner | null; localUserId: number | null; config: UptimeConfig; readJson: (req: IncomingMessage) => Promise<Record<string, unknown>>; json: (res: ServerResponse, status: number, payload: unknown) => void; connect?: typeof withUptime }
+type Context = { database: Database; request: IncomingMessage; response: ServerResponse; url: URL; user: SiteOwner | null; localUserId: number | null; config: UptimeConfig; readJson: (req: IncomingMessage) => Promise<Record<string, unknown>>; json: (res: ServerResponse, status: number, payload: unknown) => void; connect?: typeof withUptime; models?: typeof fetchAvailabilityModels }
 const fields = 'id, submission_id AS siteId, group_name AS groupName, model, interval_seconds AS intervalSeconds, endpoint, state, created_at AS createdAt'
 const requests = new Map<string, { at: number; count: number }>()
 let inFlight = 0
@@ -32,6 +33,15 @@ export async function handleAvailability(c: Context) {
       return send(200, { enabled: config.enabled, tasks, sites, minInterval: 900, maxTasks: 5 })
     }
     if (!config.enabled) return send(503, { error: '持续监控尚未启用（需配置服务端凭证、源站白名单及 Uptime 出站隔离）' })
+    if (req.method === 'POST' && c.url.pathname === '/api/user/availability/models') {
+      const body = await c.readJson(req)
+      if (!validMonitorKey(body.key) || !Number.isInteger(body.siteId) || typeof body.groupName !== 'string' || body.groupName.length > 191) return send(400, { error: '站点、分组或 KEY 格式无效' })
+      const endpoint = await validateMonitorTarget(body.baseUrl, config)
+      const site = await db.get(`SELECT s.id, s.website FROM submissions s WHERE s.id = ? AND s.status = 'approved' AND (BINARY s.owner_identity = BINARY ? OR (? IS NOT NULL AND s.user_id = ?))`, [Number(body.siteId), owner, c.localUserId, c.localUserId])
+      if (!site || new URL(String(site.website)).origin !== new URL(endpoint).origin) throw new Error('请选择自己已审核站点的 API 源站')
+      if (body.groupName && !await db.get('SELECT submission_id FROM site_public_groups WHERE submission_id = ? AND BINARY group_name = BINARY ? AND BINARY website = BINARY ?', [Number(body.siteId), body.groupName, String(site.website)])) throw new Error('分组不存在，请刷新')
+      return send(200, { models: await (c.models || fetchAvailabilityModels)(String(body.baseUrl), body.key, config) })
+    }
     if (req.method === 'POST' && c.url.pathname === '/api/user/availability') {
       const body = await c.readJson(req)
       if (body.costConfirmed !== true || body.keyConfirmed !== true) return send(400, { error: '请确认持续费用及专用低额度 KEY 风险' })
@@ -44,12 +54,15 @@ export async function handleAvailability(c: Context) {
         const site = await db.get(`SELECT s.id, s.website FROM submissions s WHERE s.id = ? AND s.status = 'approved' AND (BINARY s.owner_identity = BINARY ? OR (? IS NOT NULL AND s.user_id = ?)) FOR UPDATE`, [Number(siteId), owner, c.localUserId, c.localUserId], connection)
         if (!site || new URL(String(site.website)).origin !== new URL(endpoint).origin) throw new Error('请选择自己已审核站点的 API 源站')
         if (group && !await db.get('SELECT submission_id FROM site_public_groups WHERE submission_id = ? AND BINARY group_name = BINARY ? AND BINARY website = BINARY ?', [Number(siteId), group, String(site.website)], connection)) throw new Error('分组不存在，请刷新；无公开分组时可选择未指定')
+        const models = await (c.models || fetchAvailabilityModels)(String(body.baseUrl), key, config)
+        if (!models.includes(model)) throw new Error('请选择当前 KEY 的上游模型列表中的模型，刷新列表后重试')
         const quota = await db.get(`SELECT SUM(state <> 'deleted') AS total, SUM(BINARY owner_identity = BINARY ? AND state <> 'deleted') AS owned, SUM(BINARY owner_identity = BINARY ? AND created_at >= UTC_TIMESTAMP() - INTERVAL 1 DAY) AS daily FROM lab_monitors`, [owner, owner], connection)
         if (Number(quota?.total) >= 200 || Number(quota?.owned) >= 5 || Number(quota?.daily) >= 10) throw new Error('任务配额已满（每人 5 个，每日 10 次创建，全局 200 个）')
         await db.run(`INSERT INTO lab_monitors (id, owner_identity, submission_id, group_name, model, interval_seconds, endpoint, state) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`, [id, owner, Number(siteId), group, model, Number(interval), endpoint], connection)
       })
       // Reserve before remote creation. A lost acknowledgement stays pending; never discover/adopt monitors by prefix.
       await connect(config, async rpc => {
+        await requireUptimeEncryption(rpc)
         const added = await rpc('add', monitorPayload(marker, endpoint, model, key, Number(interval)))
         if (!Number.isSafeInteger(added.monitorID) || Number(added.monitorID) <= 0) throw new Error('监控绑定失败，请联系管理员检查待绑定任务')
         await db.run("UPDATE lab_monitors SET monitor_id = ?, state = 'paused' WHERE id = ? AND BINARY owner_identity = BINARY ?", [Number(added.monitorID), id, owner])
@@ -71,6 +84,8 @@ export async function handleAvailability(c: Context) {
       const { monitor } = await rpc('getMonitor', monitorId)
       if (!monitor || monitor.name !== `Lab:${task.id}` || monitor.url !== task.endpoint || monitor.type !== 'json-query' || monitor.parent != null || Number(monitor.maxredirects) !== 0 || Number(monitor.interval) !== Number(task.interval_seconds)) throw new Error('绑定配置已在 Uptime 改动，操作已拒绝，请管理员核对')
       if (action === 'resume') {
+        await requireUptimeEncryption(rpc)
+        if (monitor.labCredentialEncrypted !== true) throw new Error('监控服务中的旧 Lab 凭证尚未迁移，禁止启用')
         const expected = monitorPayload(`Lab:${task.id}`, String(task.endpoint), String(task.model), '', Number(task.interval_seconds))
         if (monitor.method !== expected.method || monitor.body !== expected.body || monitor.jsonPath !== expected.jsonPath || monitor.jsonPathOperator !== expected.jsonPathOperator || String(monitor.expectedValue) !== expected.expectedValue || Number(monitor.timeout) !== 30 || Number(monitor.maxretries) !== 0 || monitor.ignoreTls || monitor.upsideDown || !Array.isArray(monitor.accepted_statuscodes) || monitor.accepted_statuscodes.join(',') !== '200') throw new Error('绑定配置已在 Uptime 改动，启用已拒绝，请管理员核对')
       }
@@ -94,7 +109,7 @@ export async function handleAvailability(c: Context) {
           })
   } catch (error) {
     // Never forward upstream errors, request/response bodies or credential-bearing monitor objects.
-    const message = error instanceof Error && /^(请选择|分组不存在|任务配额|API 地址|API address|基址仅|请填写|绑定配置|任务绑定|监控服务|DNS 校验)/.test(error.message) ? error.message : '监控操作未完成，请刷新核对；待绑定任务请联系管理员，不要重复创建'
+    const message = error instanceof Error && /^(请选择|分组不存在|任务配额|API 地址|API address|基址仅|请填写|绑定配置|任务绑定|监控服务|DNS 校验|模型列表获取失败)/.test(error.message) ? error.message : '监控操作未完成，请刷新核对；待绑定任务请联系管理员，不要重复创建'
     return send(400, { error: message })
   }
 }

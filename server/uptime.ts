@@ -17,6 +17,7 @@ export function uptimeConfig(env: Record<string, string | undefined>): UptimeCon
 
 export async function validateMonitorTarget(value: unknown, config: UptimeConfig, resolve = (host: string) => lookup(host, { all: true })) {
   if (typeof value !== 'string') throw new Error('请填写 HTTPS API 基址')
+  if (new URL(value).hash) throw new Error('API 地址不能包含片段')
   const url = validateLogoUrl(value)
   if (url.protocol !== 'https:' || url.search || url.hash || !config.origins.includes(url.origin)) throw new Error('API 地址不在管理员允许的 HTTPS 源站范围内')
   if (!/^\/(?:v1\/?)?$/.test(url.pathname)) throw new Error('基址仅支持源站或 /v1')
@@ -29,7 +30,13 @@ export function monitorPayload(marker: string, url: string, model: string, key: 
   return { name: marker, type: 'json-query', url, method: 'POST', active: false, interval, retryInterval: interval, maxretries: 0, timeout: 30, maxredirects: 0, ignoreTls: false, upsideDown: false, accepted_statuscodes: ['200'], httpBodyEncoding: 'json', headers: JSON.stringify({ 'Content-Type': 'application/json', Authorization: `Bearer ${key}` }), body: JSON.stringify({ model, messages: [{ role: 'user', content: 'Reply OK.' }], max_tokens: 16, stream: false }), jsonPath: '$exists(choices[0].message.content) and $type(choices[0].message.content) = "string" and $length(choices[0].message.content) > 0 and $not($exists(error))', jsonPathOperator: '==', expectedValue: 'true', notificationIDList: {}, parent: null, proxyId: null, resendInterval: 0 }
 }
 
-type Reply = { ok?: boolean; monitorID?: number; monitor?: Record<string, unknown>; data?: Record<string, unknown>[] }
+type Reply = { ok?: boolean; monitorID?: number; monitor?: Record<string, unknown>; data?: Record<string, unknown>[]; labEncryption?: { version?: number; algorithm?: string; encryptedAtRest?: boolean; redactedManagement?: boolean } }
+export async function requireUptimeEncryption(rpc: UptimeRpc) {
+  try {
+    const { labEncryption: capability } = await rpc('labEncryptionCapabilities')
+    if (capability?.version !== 1 || capability.algorithm !== 'AES-256-GCM' || capability.encryptedAtRest !== true || capability.redactedManagement !== true) throw new Error('Unsupported encryption')
+  } catch { throw new Error('监控服务未确认支持 Lab 凭证加密；已拒绝发送 KEY，请先升级并配置 Uptime') }
+}
 export type UptimeRpc = (event: string, ...args: unknown[]) => Promise<Reply>
 export async function withUptime<T>(config: UptimeConfig, action: (rpc: UptimeRpc) => Promise<T>): Promise<T> {
   const socket: Socket = io(config.url, { autoConnect: false, reconnection: false, transports: ['websocket'], timeout: 5000, rejectUnauthorized: true })

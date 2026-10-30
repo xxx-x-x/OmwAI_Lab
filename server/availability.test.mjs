@@ -59,7 +59,7 @@ test('creation reserves owned DB binding before add, creates paused and never re
     get: async sql => sql.includes('FROM submissions') ? { id: 7, website: 'https://8.8.8.8' } : sql.includes('SUM(') ? { total: 0, owned: 0, daily: 0 } : { id: 1 },
     run: async (sql, params) => { order.push(sql.startsWith('INSERT') ? 'reserve' : 'bind'); writes.push({ sql, params }) },
   }
-  const result = await handleAvailability(context({ url: new URL('http://lab/api/user/availability'), database: db, readJson: async () => body, config: { ...config, origins: ['https://8.8.8.8'] }, connect: async (_config, fn) => fn(async (event, payload) => { order.push(event); assert.equal(payload.active, false); assert.equal(payload.type, 'json-query'); return { ok: true, monitorID: 123 } }) }))
+  const result = await handleAvailability(context({ url: new URL('http://lab/api/user/availability'), database: db, readJson: async () => body, config: { ...config, origins: ['https://8.8.8.8'] }, models: async () => ['model-1'], connect: async (_config, fn) => fn(async (event, payload) => { if (event === 'labEncryptionCapabilities') return { ok: true, labEncryption: { version: 1, algorithm: 'AES-256-GCM', encryptedAtRest: true, redactedManagement: true } }; order.push(event); assert.equal(payload.active, false); assert.equal(payload.type, 'json-query'); return { ok: true, monitorID: 123 } }) }))
   assert.equal(result.status, 201); assert.deepEqual(order, ['reserve', 'add', 'bind'])
   assert.ok(!JSON.stringify(writes).includes(body.key)); assert.ok(!JSON.stringify(result).includes(body.key))
 })
